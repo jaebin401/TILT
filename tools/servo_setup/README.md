@@ -51,6 +51,25 @@ python servo_setup.py ping \
   --id 1
 ```
 
+### Find the current servo ID
+
+서보 ID를 모르거나 `ping`에 응답하지 않으면 유효한 ID 범위 `0~253` 전체를 검색합니다. 이 명령은 서보를 움직이거나 설정을 변경하지 않습니다.
+
+```bash
+python servo_setup.py check-id \
+  --port /dev/cu.wchusbserialXXXX
+```
+
+검색은 기본 통신 속도인 1,000,000 baud에서 실행되며 응답이 없는 경우 약 15초가 걸릴 수 있습니다. 다른 통신 속도를 확인하려면 `--baud`를 지정합니다.
+
+```bash
+python servo_setup.py check-id \
+  --port /dev/cu.wchusbserialXXXX \
+  --baud 500000
+```
+
+서보가 발견되면 ID와 모델 번호가 출력됩니다. 발견된 ID는 이후 `ping`, `read`, `center`, `release` 명령의 `--id`에 사용합니다.
+
 ### Read the current position
 
 ```bash

@@ -102,6 +102,13 @@ class ServoBus:
         self._check(f"Ping servo {target_id}", result, error)
         return model_number
 
+    def try_ping(self, target_id: int) -> int | None:
+        """Return the model number when an ID responds, otherwise return None."""
+        model_number, result, error = self.servo.ping(target_id)
+        if result != self._comm_success or error != 0:
+            return None
+        return model_number
+
     def read_position(self, target_id: int) -> int:
         position, result, error = self.servo.ReadPos(target_id)
         self._check(f"Read position from servo {target_id}", result, error)
@@ -153,6 +160,28 @@ def list_serial_ports() -> int:
     return 0
 
 
+def check_id(bus: ServoBus) -> list[tuple[int, int]]:
+    """Ping every valid servo ID and return (ID, model number) pairs."""
+    found: list[tuple[int, int]] = []
+
+    print(
+        f"Scanning servo IDs {MIN_SERVO_ID} through {MAX_SERVO_ID} "
+        f"at {bus.baud_rate} baud."
+    )
+    print("This may take about 15 seconds when no servo responds.")
+
+    for target_id in range(MIN_SERVO_ID, MAX_SERVO_ID + 1):
+        if target_id % 32 == 0:
+            print(f"Checking ID {target_id}...", flush=True)
+
+        model_number = bus.try_ping(target_id)
+        if model_number is not None:
+            found.append((target_id, model_number))
+            print(f"Found servo ID {target_id}; model number: {model_number}")
+
+    return found
+
+
 def confirm_center_move(target_id: int, current_position: int) -> bool:
     delta = CENTER_POSITION - current_position
     delta_degrees = delta * 360.0 / POSITION_STEPS_PER_REVOLUTION
@@ -192,23 +221,27 @@ def wait_for_center(
     )
 
 
-def add_connection_arguments(parser: argparse.ArgumentParser) -> None:
+def add_port_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--port",
         required=True,
         help="serial port such as /dev/cu.wchusbserialXXXX",
     )
     parser.add_argument(
-        "--id",
-        type=servo_id,
-        default=DEFAULT_SERVO_ID,
-        help=f"servo ID (default: {DEFAULT_SERVO_ID})",
-    )
-    parser.add_argument(
         "--baud",
         type=int,
         default=DEFAULT_BAUD_RATE,
         help=f"servo baud rate (default: {DEFAULT_BAUD_RATE})",
+    )
+
+
+def add_connection_arguments(parser: argparse.ArgumentParser) -> None:
+    add_port_arguments(parser)
+    parser.add_argument(
+        "--id",
+        type=servo_id,
+        default=DEFAULT_SERVO_ID,
+        help=f"servo ID (default: {DEFAULT_SERVO_ID})",
     )
 
 
@@ -222,6 +255,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     ping_parser = subparsers.add_parser("ping", help="verify communication with one servo")
     add_connection_arguments(ping_parser)
+
+    check_id_parser = subparsers.add_parser(
+        "check-id",
+        help="scan every servo ID from 0 through 253",
+    )
+    add_port_arguments(check_id_parser)
 
     read_parser = subparsers.add_parser("read", help="read the current servo position")
     add_connection_arguments(read_parser)
@@ -249,6 +288,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_bus_command(args: argparse.Namespace) -> int:
     with ServoBus(args.port, args.baud) as bus:
+        if args.command == "check-id":
+            found = check_id(bus)
+            if not found:
+                print("Scan complete; no servo IDs responded.")
+                return 0
+
+            id_list = ", ".join(str(target_id) for target_id, _ in found)
+            print(f"Scan complete; found {len(found)} servo(s): {id_list}")
+            return 0
+
         if args.command == "ping":
             model_number = bus.ping(args.id)
             print(f"Servo {args.id} responded; model number: {model_number}")
