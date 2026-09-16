@@ -20,6 +20,7 @@ CENTER_TOLERANCE = 10
 CENTER_TIMEOUT_SECONDS = 20.0
 
 TORQUE_ENABLE_ADDRESS = 40
+SERVO_ID_ADDRESS = 5
 MIN_SERVO_ID = 0
 MAX_SERVO_ID = 253
 POSITION_STEPS_PER_REVOLUTION = 4096
@@ -123,6 +124,30 @@ class ServoBus:
         state = "enable" if enabled else "disable"
         self._check(f"{state.capitalize()} torque on servo {target_id}", result, error)
 
+    def unlock_eeprom(self, target_id: int) -> None:
+        result, error = self.servo.unLockEprom(target_id)
+        self._check(f"Unlock EEPROM on servo {target_id}", result, error)
+
+    def lock_eeprom(self, target_id: int) -> None:
+        result, error = self.servo.LockEprom(target_id)
+        self._check(f"Lock EEPROM on servo {target_id}", result, error)
+
+    def write_id(self, current_id: int, new_id: int) -> None:
+        result, error = self.servo.write1ByteTxRx(
+            current_id,
+            SERVO_ID_ADDRESS,
+            new_id,
+        )
+        if result != self._comm_success:
+            time.sleep(0.1)
+            if self.try_ping(new_id) is not None:
+                return
+        self._check(f"Change servo ID {current_id} to {new_id}", result, error)
+
+    def try_lock_eeprom(self, target_id: int) -> bool:
+        result, error = self.servo.LockEprom(target_id)
+        return result == self._comm_success and error == 0
+
     def write_center(self, target_id: int) -> None:
         result, error = self.servo.WritePosEx(
             target_id,
@@ -180,6 +205,68 @@ def check_id(bus: ServoBus) -> list[tuple[int, int]]:
             print(f"Found servo ID {target_id}; model number: {model_number}")
 
     return found
+
+
+def confirm_id_change(current_id: int, new_id: int, model_number: int) -> bool:
+    print()
+    print(f"Current servo ID: {current_id}")
+    print(f"New servo ID:     {new_id}")
+    print(f"Model number:     {model_number}")
+    print()
+    print("Keep exactly one servo connected while changing its ID.")
+    expected = f"SET {current_id} {new_id}"
+    response = input(f"Type {expected} to continue: ").strip()
+    return response == expected
+
+
+def change_servo_id(bus: ServoBus, current_id: int, new_id: int) -> int:
+    if current_id == new_id:
+        raise ServoToolError("Current ID and new ID must be different.")
+
+    model_number = bus.ping(current_id)
+    if bus.try_ping(new_id) is not None:
+        raise ServoToolError(
+            f"Servo ID {new_id} already responds. Choose an unused ID and keep "
+            "only one servo connected."
+        )
+
+    if not confirm_id_change(current_id, new_id, model_number):
+        print("ID change cancelled; no EEPROM setting was changed.")
+        return 2
+
+    eeprom_unlocked = False
+    try:
+        bus.set_torque(current_id, False)
+        bus.unlock_eeprom(current_id)
+        eeprom_unlocked = True
+        bus.write_id(current_id, new_id)
+        time.sleep(0.1)
+        bus.lock_eeprom(new_id)
+        eeprom_unlocked = False
+    except (ServoToolError, KeyboardInterrupt):
+        if eeprom_unlocked:
+            locked = bus.try_lock_eeprom(new_id) or bus.try_lock_eeprom(current_id)
+            if not locked:
+                print(
+                    "WARNING: Could not confirm that EEPROM was re-locked. "
+                    "Turn the servo power off before retrying.",
+                    file=sys.stderr,
+                )
+        raise
+
+    verified_model = bus.ping(new_id)
+    if bus.try_ping(current_id) is not None:
+        raise ServoToolError(
+            f"Both ID {current_id} and ID {new_id} responded after the change. "
+            "Disconnect power and verify that only one servo is connected."
+        )
+
+    print(
+        f"Servo ID changed successfully: {current_id} -> {new_id} "
+        f"(model number: {verified_model})."
+    )
+    print(f"Label this servo and its cable with ID {new_id} before disconnecting it.")
+    return 0
 
 
 def confirm_center_move(target_id: int, current_position: int) -> bool:
@@ -262,6 +349,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_port_arguments(check_id_parser)
 
+    set_id_parser = subparsers.add_parser(
+        "set-id",
+        help="change the ID of exactly one connected servo",
+    )
+    add_port_arguments(set_id_parser)
+    set_id_parser.add_argument(
+        "--current-id",
+        type=servo_id,
+        required=True,
+        help="current servo ID",
+    )
+    set_id_parser.add_argument(
+        "--new-id",
+        type=servo_id,
+        required=True,
+        help="new unused servo ID",
+    )
+
     read_parser = subparsers.add_parser("read", help="read the current servo position")
     add_connection_arguments(read_parser)
 
@@ -297,6 +402,9 @@ def run_bus_command(args: argparse.Namespace) -> int:
             id_list = ", ".join(str(target_id) for target_id, _ in found)
             print(f"Scan complete; found {len(found)} servo(s): {id_list}")
             return 0
+
+        if args.command == "set-id":
+            return change_servo_id(bus, args.current_id, args.new_id)
 
         if args.command == "ping":
             model_number = bus.ping(args.id)

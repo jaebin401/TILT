@@ -2,7 +2,7 @@
 
 맥북에서 Waveshare Bus Servo Adapter (A)를 통해 STS3215-C001 서보의 통신 상태와 현재 위치를 확인하고, 혼을 조립하기 위한 기계적 중앙 위치 `2047`로 이동시키는 도구입니다.
 
-이 도구는 ESP32 펌웨어가 아닙니다. 맥에서 직접 실행하는 일회성 설정 도구이며, 영구 오프셋 보정과 서보 ID 변경은 아직 포함하지 않습니다.
+이 도구는 ESP32 펌웨어가 아닙니다. 맥에서 직접 실행하는 일회성 설정 도구이며, 서보 검색, ID 변경, 기계적 중앙 정렬을 지원합니다. 영구 오프셋 보정은 아직 포함하지 않습니다.
 
 ## Safety
 
@@ -10,6 +10,7 @@
 - Waveshare 보드는 입력 전압을 조절하지 않으므로 입력 전압이 그대로 서보에 전달됩니다.
 - USB 제어 시 Waveshare 점퍼를 `B` 위치에 둡니다.
 - 처음에는 서보 한 개만 연결합니다.
+- `set-id` 명령은 반드시 서보 한 개만 연결한 상태에서 실행합니다. 같은 ID의 서보 여러 개를 동시에 연결하지 않습니다.
 - `center` 명령 전에 혼과 링크를 분리합니다.
 - 외부 서보 전원을 즉시 끌 수 있는 상태에서 실행합니다.
 - 서보가 움직이는 동안 축과 링크를 손으로 잡지 않습니다.
@@ -70,6 +71,28 @@ python servo_setup.py check-id \
 
 서보가 발견되면 ID와 모델 번호가 출력됩니다. 발견된 ID는 이후 `ping`, `read`, `center`, `release` 명령의 `--id`에 사용합니다.
 
+### Change one servo ID
+
+ID 변경은 EEPROM에 저장되므로 전원을 껐다 켜도 유지됩니다. 새 서보는 일반적으로 ID `1`이므로, 반드시 대상 서보 한 개만 연결한 뒤 실행합니다.
+
+```bash
+python servo_setup.py set-id \
+  --port /dev/cu.wchusbserialXXXX \
+  --current-id 1 \
+  --new-id 11
+```
+
+도구는 다음 순서로 안전하게 변경합니다.
+
+1. 기존 ID가 응답하는지 확인합니다.
+2. 새 ID가 이미 사용 중인지 확인합니다.
+3. `SET 1 11`과 같은 확인 문구를 요구합니다.
+4. 토크를 해제하고 EEPROM 잠금을 해제합니다.
+5. ID를 기록하고 새 ID로 EEPROM을 다시 잠급니다.
+6. 새 ID는 응답하고 기존 ID는 응답하지 않는지 검증합니다.
+
+성공하면 전원을 끄고 모터와 케이블에 관절 약어와 ID를 함께 표시합니다. 그다음 서보로 넘어갈 때는 새 서보만 연결하고 같은 과정을 반복합니다.
+
 ### Read the current position
 
 ```bash
@@ -112,18 +135,36 @@ python servo_setup.py release \
 Hip Yaw → Hip Pitch → Knee Pitch
 ```
 
-향후 사용할 기본 ID 매핑은 다음과 같습니다.
+좌우는 관찰자가 아니라 로봇이 바라보는 방향을 기준으로 합니다. 권장 ID는 십의 자리로 다리를, 일의 자리로 관절 순서를 구분합니다.
 
-| ID | Joint |
-| ---: | --- |
-| 1 | Left Hip Yaw |
-| 2 | Left Hip Pitch |
-| 3 | Left Knee Pitch |
-| 4 | Right Hip Yaw |
-| 5 | Right Hip Pitch |
-| 6 | Right Knee Pitch |
+| Label | ID | Joint |
+| --- | ---: | --- |
+| `LHY-11` | 11 | Left Hip Yaw |
+| `LHP-12` | 12 | Left Hip Pitch |
+| `LKP-13` | 13 | Left Knee Pitch |
+| `RHY-21` | 21 | Right Hip Yaw |
+| `RHP-22` | 22 | Right Hip Pitch |
+| `RKP-23` | 23 | Right Knee Pitch |
 
-ID 변경은 별도 도구 작업에서 한 번에 서보 하나만 연결한 상태로 진행합니다.
+새 서보 여섯 개가 모두 ID `1`이라면 각 모터를 하나씩 연결해 다음 순서로 할당합니다.
+
+```text
+1 -> 11  Left Hip Yaw
+1 -> 12  Left Hip Pitch
+1 -> 13  Left Knee Pitch
+1 -> 21  Right Hip Yaw
+1 -> 22  Right Hip Pitch
+1 -> 23  Right Knee Pitch
+```
+
+모든 할당이 끝난 뒤 여섯 개를 함께 연결하고 최종 확인합니다.
+
+```bash
+python servo_setup.py check-id \
+  --port /dev/cu.wchusbserialXXXX
+```
+
+최종 검색 결과에는 `11, 12, 13, 21, 22, 23`이 각각 한 번씩 나타나야 합니다.
 
 ## Mechanical Center vs Offset Calibration
 
