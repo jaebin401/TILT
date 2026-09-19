@@ -5,7 +5,7 @@
 A compact 6-DoF biped robot platform for iterative locomotion experiments.
 
 <p align="center">
-  <img src="docs/image/TILT%20mk1.png" alt="TILT MK1 CAD model" width="720">
+  <img src="docs/image/TILT%20cad%20and%20real.png" alt="TILT MK1 CAD model" width="720">
 </p>
 
 ## Overview
