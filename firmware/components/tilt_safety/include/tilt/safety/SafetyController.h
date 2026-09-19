@@ -56,6 +56,10 @@ public:
     // Stores a validated logical boot-time snapshot, not a runtime reference.
     bool initializeBootReference(const core::JointPositionReference& reference);
     bool hasBootReference() const;
+    // 부팅 기준값과 모든 제한값이 준비된 Disarmed 상태에서만 Armed로 전환한다.
+    bool arm();
+    // Fault는 해제하지 않고, 정상 상태의 출력 권한만 회수한다.
+    void disarm();
     SafetyResult evaluate(const core::JointTargetBatch& batch);
     // runtime_reference is the current logical joint position, not the boot snapshot.
     SafetyResult evaluate(const core::JointTargetBatch& batch,
