@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+#include <tilt/core/JointCommandSource.h>
+
 namespace tilt {
 namespace core {
 
@@ -9,7 +11,7 @@ namespace core {
 struct JointTargetBatch {
     uint32_t seq;
     uint32_t timestamp_ms;
-    uint8_t source;       // GAIT, INIT, or FAULT_RECOVERY; numeric values are not defined yet.
+    JointCommandSource source = JointCommandSource::Initialization;
     uint16_t duration_ms;
     float angle_rad[6];   // Logical joint indices below; no servo IDs here.
 };

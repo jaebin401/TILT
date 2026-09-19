@@ -87,7 +87,7 @@ bool SafetyController::emergencyStopLatched() const {
 
 bool SafetyController::initializeBootReference(
     const core::JointPositionReference& reference) {
-    if (state_ == SafetyState::Fault || !position_limits_.has_value() ||
+    if (state_ != SafetyState::Disarmed || !position_limits_.has_value() ||
         !validatePositionLimits(reference, *position_limits_)) {
         return false;
     }
@@ -98,6 +98,23 @@ bool SafetyController::initializeBootReference(
 
 bool SafetyController::hasBootReference() const {
     return boot_reference_.has_value();
+}
+
+bool SafetyController::arm() {
+    if (state_ != SafetyState::Disarmed || fault_mask_ != 0 ||
+        !position_limits_.has_value() || !velocity_limits_.has_value() ||
+        !boot_reference_.has_value()) {
+        return false;
+    }
+
+    state_ = SafetyState::Armed;
+    return true;
+}
+
+void SafetyController::disarm() {
+    if (state_ != SafetyState::Fault) {
+        state_ = SafetyState::Disarmed;
+    }
 }
 
 SafetyResult SafetyController::evaluate(const core::JointTargetBatch& batch) {
@@ -116,11 +133,12 @@ SafetyResult SafetyController::evaluate(const core::JointTargetBatch& batch) {
 SafetyResult SafetyController::evaluate(
     const core::JointTargetBatch& batch,
     const core::JointPositionReference& runtime_reference) {
-    if (fault_mask_ != 0) {
+    if (state_ != SafetyState::Armed || fault_mask_ != 0) {
         return {SafetyResult::Status::Rejected, std::nullopt};
     }
     if (!position_limits_.has_value() ||
-        !validatePositionLimits(batch, *position_limits_)) {
+        !validatePositionLimits(batch, *position_limits_) ||
+        !validatePositionLimits(runtime_reference, *position_limits_)) {
         return {SafetyResult::Status::Rejected, std::nullopt};
     }
     if (!velocity_limits_.has_value() ||
@@ -128,8 +146,7 @@ SafetyResult SafetyController::evaluate(
         return {SafetyResult::Status::Rejected, std::nullopt};
     }
 
-    // Passing both validations is still not permission to move while Disarmed.
-    return {SafetyResult::Status::Rejected, std::nullopt};
+    return {SafetyResult::Status::Accepted, batch};
 }
 
 }  // namespace safety
