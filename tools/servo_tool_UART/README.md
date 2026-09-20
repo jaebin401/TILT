@@ -12,39 +12,42 @@
 ## 위치
 
 ```
-firmware/
-├── components/
-│   ├── tilt_config/
-│   └── tilt_sts3215/
+TILT/
+├── firmware/
+│   └── components/
+│       ├── tilt_config/
+│       └── tilt_sts3215/
 └── tools/
-    └── servo_tool/     ← 이 프로젝트
+    └── servo_tool_UART/     ← 이 프로젝트
 ```
 
-루트 `CMakeLists.txt` 의 `EXTRA_COMPONENT_DIRS` 가 `../../components` 를 가리키므로,
-이 디렉토리에서 바로 빌드하면 공용 컴포넌트가 딸려 온다.
+루트 `CMakeLists.txt` 의 `EXTRA_COMPONENT_DIRS` 가
+`../../firmware/components` 를 가리키므로, 이 디렉토리에서 바로 빌드하면
+공용 컴포넌트가 딸려 온다.
 
 ## 빌드
 
 ```bash
-cd firmware/tools/servo_tool
+cd tools/servo_tool_UART
 idf.py set-target esp32s3
 idf.py -p /dev/tty.usbmodemXXXX flash monitor
 ```
 
 `Ctrl + ]` 로 모니터 종료.
 
-## tilt_sts3215 에 요구하는 인터페이스
+## tilt_sts3215 연결 방식
 
 ```cpp
-bool servo_bus_init();
-bool servo_ping(uint8_t id);
-bool servo_read_tick(uint8_t id, uint16_t* out_tick);
-void servo_write_tick(uint8_t id, uint16_t tick, uint16_t speed);
-void servo_torque(uint8_t id, bool on);
-void servo_set_baud(uint32_t baud);
+tilt::sts3215::Sts3215Bus bus{config};
+bus.initialize();
+bus.ping(id);
+bus.readPosition(id, tick);
+bus.writePosition(id, tick, speed);
+bus.setTorque(id, enabled);
+bus.setBaudRate(baud);
 ```
 
-이름이 다르면 `main.cpp` 상단의 호출부만 고치면 된다.
+`main.cpp` 상단의 얇은 래퍼가 기존 도구 호출을 이 실제 API로 연결한다.
 
 ## 저장 정책
 

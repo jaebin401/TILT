@@ -22,22 +22,50 @@
 #include "nvs.h"
 
 #include "tilt_config.h"
-#include "tilt_sts3215.hpp"
+#include "tilt/sts3215/Sts3215Bus.h"
 
 using namespace tilt;
 
 // ─────────────────────────────────────────────────────────────────────
-// tilt_sts3215 에 요구하는 최소 인터페이스
-//
-//   bool servo_bus_init();
-//   bool servo_ping(uint8_t id);
-//   bool servo_read_tick(uint8_t id, uint16_t* out_tick);
-//   void servo_write_tick(uint8_t id, uint16_t tick, uint16_t speed);
-//   void servo_torque(uint8_t id, bool on);
-//   void servo_set_baud(uint32_t baud);
-//
-// 이름이 다르면 아래 래퍼만 고치면 된다.
+// Existing tool calls are kept behind a thin adapter to the current
+// tilt::sts3215::Sts3215Bus API.
 // ─────────────────────────────────────────────────────────────────────
+
+static tilt::sts3215::Sts3215Bus& bus() {
+    static tilt::sts3215::Sts3215Bus instance{[] {
+        tilt::sts3215::BusConfig cfg{};
+        cfg.uart_port = static_cast<uart_port_t>(tilt::SERVO_UART_PORT);
+        cfg.tx_pin = static_cast<gpio_num_t>(tilt::SERVO_UART_TX_PIN);
+        cfg.rx_pin = static_cast<gpio_num_t>(tilt::SERVO_UART_RX_PIN);
+        cfg.baud_rate = tilt::SERVO_UART_BAUD;
+        return cfg;
+    }()};
+    return instance;
+}
+
+static bool servo_bus_init() {
+    return bus().initialize() == ESP_OK;
+}
+
+static bool servo_ping(uint8_t id) {
+    return bus().ping(id) == ESP_OK;
+}
+
+static bool servo_read_tick(uint8_t id, uint16_t* out_tick) {
+    return out_tick != nullptr && bus().readPosition(id, *out_tick) == ESP_OK;
+}
+
+static void servo_write_tick(uint8_t id, uint16_t tick, uint16_t speed) {
+    bus().writePosition(id, tick, speed);
+}
+
+static void servo_torque(uint8_t id, bool on) {
+    bus().setTorque(id, on);
+}
+
+static void servo_set_baud(uint32_t baud) {
+    bus().setBaudRate(baud);
+}
 
 static const char *NVS_NAMESPACE = "tilt_cal";
 static const char *NVS_KEY_ZERO  = "zero_tick";
@@ -60,7 +88,7 @@ static bool s_coarse = false;   // false = FINE(1 tick), true = COARSE
 static constexpr int FINE_STEP   = 1;
 static constexpr int COARSE_STEP = 20;
 
-static const char *JOINT_NAME[NUM_JOINTS] = {
+static const char *JOINT_LABEL[NUM_JOINTS] = {
     "L_HIP_YAW", "L_HIP_PITCH", "L_KNEE_PITCH",
     "R_HIP_YAW", "R_HIP_PITCH", "R_KNEE_PITCH",
 };
@@ -146,18 +174,18 @@ static void nvs_clear_scratch() {
 // ── 출력: 붙여넣기용 C 코드 ──────────────────────────────────────────
 static void print_zero_array() {
     printf("\n// ── tilt_config.h 의 ZERO_TICK 을 아래로 교체 ──\n");
-    printf("constexpr uint16_t ZERO_TICK[NUM_JOINTS] = {\n");
+    printf("inline constexpr std::uint16_t ZERO_TICK[NUM_JOINTS] = {\n");
     for (int j = 0; j < NUM_JOINTS; ++j) {
-        printf("    %4u,  // %s\n", s_zero[j], JOINT_NAME[j]);
+        printf("    %4u,  // %s\n", s_zero[j], JOINT_LABEL[j]);
     }
     printf("};\n\n");
 }
 
 static void print_sign_array() {
     printf("\n// ── tilt_config.h 의 JOINT_SIGN 을 아래로 교체 ──\n");
-    printf("constexpr int8_t JOINT_SIGN[NUM_JOINTS] = {\n");
+    printf("inline constexpr std::int8_t JOINT_SIGN[NUM_JOINTS] = {\n");
     for (int j = 0; j < NUM_JOINTS; ++j) {
-        printf("    %+d,  // %s\n", s_sign[j], JOINT_NAME[j]);
+        printf("    %+d,  // %s\n", s_sign[j], JOINT_LABEL[j]);
     }
     printf("};\n\n");
 }
@@ -165,14 +193,19 @@ static void print_sign_array() {
 static void print_limit_array() {
     printf("\n// ── tilt_config.h 의 JOINT_LIMIT 을 아래로 교체 ──\n");
     printf("//    (실측 가동범위. 실제로는 여기서 여유를 두고 좁히는 걸 권장)\n");
-    printf("constexpr JointLimit JOINT_LIMIT[NUM_JOINTS] = {\n");
-    for (int j = 0; j < NUM_JOINTS; ++j) {
-        float a = tick_to_dh_deg(j, s_range_min[j]);
-        float b = tick_to_dh_deg(j, s_range_max[j]);
-        float lo = (a < b) ? a : b;
-        float hi = (a < b) ? b : a;
-        printf("    { %+7.1ff * DEG2RAD, %+7.1ff * DEG2RAD },  // %s\n",
-               lo, hi, JOINT_NAME[j]);
+    printf("inline constexpr JointLimit JOINT_LIMIT[2][3] = {\n");
+    for (int leg = 0; leg < 2; ++leg) {
+        printf("    {\n");
+        for (int leg_joint = 0; leg_joint < 3; ++leg_joint) {
+            const int j = leg * 3 + leg_joint;
+            const float a = tick_to_dh_deg(j, s_range_min[j]);
+            const float b = tick_to_dh_deg(j, s_range_max[j]);
+            const float lo = (a < b) ? a : b;
+            const float hi = (a < b) ? b : a;
+            printf("        { %+7.1ff * DEG2RAD, %+7.1ff * DEG2RAD },  // %s\n",
+                   lo, hi, JOINT_LABEL[j]);
+        }
+        printf("    },\n");
     }
     printf("};\n\n");
 }
@@ -186,7 +219,7 @@ static void torque_all(bool on) {
 }
 
 static void emergency_stop() {
-    torque_all(false);
+    bus().emergencyStop(tilt::SERVO_ID, tilt::NUM_JOINTS);
     printf("\n!! 비상정지: 전체 토크 OFF !!\n");
 }
 
@@ -295,7 +328,7 @@ static void jog_print_table() {
     printf("  ------------------------------------------------\n");
     for (int j = 0; j < NUM_JOINTS; ++j) {
         printf("  %-14s %6u %9.2f %9.2f\n",
-               JOINT_NAME[j], s_cur[j],
+               JOINT_LABEL[j], s_cur[j],
                s_cur[j] * DEG_PER_TICK,
                tick_to_dh_deg(j, s_cur[j]));
     }
@@ -334,7 +367,7 @@ static void tool_jog() {
             s_cur[j] = clamp_tick(static_cast<int32_t>(s_cur[j]) + km.dir * step_size());
             servo_write_tick(SERVO_ID[j], s_cur[j], 0);
             printf("%-14s tick=%4u  DH theta=%+7.2f deg  [%s]\n",
-                   JOINT_NAME[j], s_cur[j], tick_to_dh_deg(j, s_cur[j]), mode_name());
+                   JOINT_LABEL[j], s_cur[j], tick_to_dh_deg(j, s_cur[j]), mode_name());
             break;
         }
     }
@@ -352,7 +385,8 @@ static void tool_monitor() {
         if (read_all(pos)) {
             printf("\r");
             for (int j = 0; j < NUM_JOINTS; ++j) {
-                printf("%s:%4u(%+6.1f) ", JOINT_NAME[j] + 2, pos[j], tick_to_dh_deg(j, pos[j]));
+                printf("%s:%4u(%+6.1f) ", tilt::JOINT_NAME[j], pos[j],
+                       tick_to_dh_deg(j, pos[j]));
             }
             fflush(stdout);
         }
@@ -399,7 +433,7 @@ static void tool_range() {
             }
             printf("\r");
             for (int j = 0; j < NUM_JOINTS; ++j) {
-                printf("%s:[%+6.1f,%+6.1f] ", JOINT_NAME[j] + 2,
+                printf("%s:[%+6.1f,%+6.1f] ", tilt::JOINT_NAME[j],
                        tick_to_dh_deg(j, s_range_min[j]),
                        tick_to_dh_deg(j, s_range_max[j]));
             }
@@ -432,7 +466,7 @@ static void tool_sign() {
 
     for (int j = 0; j < NUM_JOINTS; ++j) {
         printf("[%d/%d] %-14s : DH + 는 \"%s\"\n",
-               j + 1, NUM_JOINTS, JOINT_NAME[j], DH_PLUS_MEANING[j]);
+               j + 1, NUM_JOINTS, JOINT_LABEL[j], DH_PLUS_MEANING[j]);
         printf("      움직입니다... ");
         fflush(stdout);
 
@@ -482,7 +516,7 @@ static void tool_goto_zero_pose() {
 
     for (int j = 0; j < NUM_JOINTS; ++j) {
         uint16_t target = dh_rad_to_tick(j, ZERO_POSE_RAD[j]);
-        printf("  %-14s %4u -> %4u\n", JOINT_NAME[j], s_cur[j], target);
+        printf("  %-14s %4u -> %4u\n", JOINT_LABEL[j], s_cur[j], target);
         s_cur[j] = target;
         servo_write_tick(SERVO_ID[j], target, 300);   // 느리게
         vTaskDelay(pdMS_TO_TICKS(400));
@@ -568,9 +602,9 @@ extern "C" void app_main(void) {
         uint16_t t = 2048;
         if (servo_read_tick(SERVO_ID[j], &t)) {
             printf("  %-14s tick=%4u  DH theta=%+7.2f deg\n",
-                   JOINT_NAME[j], t, tick_to_dh_deg(j, t));
+                   JOINT_LABEL[j], t, tick_to_dh_deg(j, t));
         } else {
-            printf("  %-14s READ 실패 — 2048 가정\n", JOINT_NAME[j]);
+            printf("  %-14s READ 실패 — 2048 가정\n", JOINT_LABEL[j]);
         }
         s_cur[j] = t;
         vTaskDelay(pdMS_TO_TICKS(10));

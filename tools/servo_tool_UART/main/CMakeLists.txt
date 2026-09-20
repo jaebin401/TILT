@@ -4,8 +4,7 @@ idf_component_register(
     REQUIRES
         tilt_config
         tilt_sts3215
-        esp_driver_uart
         esp_driver_usb_serial_jtag
         nvs_flash
+        freertos
 )
- 
