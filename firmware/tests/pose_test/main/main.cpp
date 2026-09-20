@@ -106,9 +106,12 @@ enum class CommandType : std::uint8_t {
     WALK_DELTA_DOWN,
     WALK_PERIOD_DOWN,
     WALK_PERIOD_UP,
+    WALK_LIFT_UP,
+    WALK_LIFT_DOWN,
+    WALK_TRIGGER_DOWN,
+    WALK_TRIGGER_UP,
     WALK_TOGGLE_PITCH_COMP,
-    WALK_TOGGLE_CENTER_COMP,
-    WALK_ZERO_X,
+    WALK_ZERO,
     WALK_RESET_ATTITUDE,
     WALK_VERIFY,
     WALK_QUIT,
@@ -248,16 +251,17 @@ struct FootLiftRecord {
 FootLiftRecord g_left_lift{};
 FootLiftRecord g_right_lift{};
 
-struct WalkLegState {
-    std::uint8_t phase = 0;
-    float x_mm = 0.0f;
-    bool short_leg = false;
-};
+enum class WalkSwing : std::uint8_t { NONE, LEFT, RIGHT };
 
 struct WalkStats {
-    std::uint32_t cycles = 0;
-    std::uint32_t transitions = 0;
-    std::uint32_t rejected_steps = 0;
+    std::uint32_t swing_count = 0;
+    std::uint32_t left_swings = 0;
+    std::uint32_t right_swings = 0;
+    std::uint64_t left_duration_total_ms = 0;
+    std::uint64_t right_duration_total_ms = 0;
+    std::uint32_t forced_releases = 0;
+    std::uint32_t min_time_suppressions = 0;
+    std::uint32_t rejected_targets = 0;
     std::uint32_t consecutive_rejects = 0;
     bool roll_valid = false;
     float roll_min_deg = 0.0f;
@@ -265,31 +269,36 @@ struct WalkStats {
     bool pitch_valid = false;
     float pitch_min_deg = 0.0f;
     float pitch_max_deg = 0.0f;
-    bool cycle_roll_valid = false;
-    float cycle_roll_min_deg = 0.0f;
-    float cycle_roll_max_deg = 0.0f;
 };
 
-WalkLegState g_walk_left{};
-WalkLegState g_walk_right{};
 WalkStats g_walk_stats{};
-float g_walk_legx_mm = 0.0f;
+WalkSwing g_walk_swing = WalkSwing::NONE;
+float g_walk_legx_mm = tilt_pose_test::kWalkLegxDefaultMm;
+float g_walk_lift_mm = tilt_pose_test::kWalkLiftDefaultMm;
 float g_walk_delta_mm = tilt_pose_test::kWalkDeltaDefaultMm;
 float g_walk_base_height_mm = tilt::ZERO_POSE_HEIGHT_MM;
-float g_walk_applied_delta_mm = 0.0f;
+float g_walk_roll_trigger_deg = tilt_pose_test::kWalkRollTriggerDeg;
+float g_walk_signed_delta_mm = tilt_pose_test::kWalkDeltaDefaultMm;
+float g_walk_left_x_mm = 0.0f;
+float g_walk_right_x_mm = 0.0f;
 float g_walk_last_left_x_mm = 0.0f;
 float g_walk_last_right_x_mm = 0.0f;
 float g_walk_last_left_height_mm = tilt::ZERO_POSE_HEIGHT_MM;
 float g_walk_last_right_height_mm = tilt::ZERO_POSE_HEIGHT_MM;
-std::uint32_t g_walk_leg_time_ms = tilt_pose_test::kWalkLegTimeDefaultMs;
-std::uint32_t g_walk_next_action_ms = 0;
-bool g_walk_last_cycle_roll_valid = false;
-float g_walk_last_cycle_roll_min_deg = 0.0f;
-float g_walk_last_cycle_roll_max_deg = 0.0f;
+float g_walk_last_applied_body_x_mm = 0.0f;
+std::uint32_t g_walk_rock_period_ms = tilt_pose_test::kWalkRockPeriodMs;
+std::uint32_t g_walk_next_rock_ms = 0;
+std::uint32_t g_walk_swing_started_ms = 0;
+std::uint32_t g_walk_last_transition_ms = 0;
+bool g_walk_trigger_armed = true;
+bool g_walk_min_suppression_counted = false;
+bool g_walk_target_dirty = false;
 float g_walk_summary_legx_mm = 0.0f;
+float g_walk_summary_lift_mm = 0.0f;
 float g_walk_summary_delta_mm = tilt_pose_test::kWalkDeltaDefaultMm;
-std::uint32_t g_walk_summary_leg_time_ms =
-    tilt_pose_test::kWalkLegTimeDefaultMs;
+float g_walk_summary_base_height_mm = tilt::ZERO_POSE_HEIGHT_MM;
+float g_walk_summary_trigger_deg = tilt_pose_test::kWalkRollTriggerDeg;
+std::uint32_t g_walk_summary_period_ms = tilt_pose_test::kWalkRockPeriodMs;
 
 void resetCompensationOutputs();
 void stopWalkMotion(const char* reason, bool return_home);
@@ -492,8 +501,9 @@ void printHelp() {
         "  In STAND: c comp, +/- Kp, [/] LPF, arrows height, t step test, q exit.\n"
         "  In ROCK: arrows/WASD move, f IK/FLAT, 1 sweep, 2 alternate, "
         "c/x/z compensation, k record, r attitude zero, v status, q exit.\n"
-        "  In WALK: space start/stop, arrows/WASD tune, +/- delta, [/] timing, "
-        "c/x compensation, 0 zero legx, r attitude zero, v status, q exit.\n\n");
+        "  In WALK: space start/stop, +/- lift, arrows/WASD tune, ,/. delta, "
+        "[/] period, ;/' roll trigger, c pitch comp, 0 zero lift/legx, "
+        "r attitude zero, v status, q exit.\n\n");
 }
 
 std::uint32_t requiredDurationMs(const float from[tilt::NUM_JOINTS],
@@ -1708,7 +1718,8 @@ void serviceStepResponse(std::uint32_t now) {
 void serviceCompensation() {
     if (g_imu_comp_fault_requested) {
         g_imu_comp_fault_requested = false;
-        disableAllCompensation("five consecutive IMU read failures", false);
+        disableAllCompensation("five consecutive IMU read failures",
+                               g_walk_running.load());
     }
 
     const bool compensation_active = g_pitch_comp_enabled ||
@@ -1981,14 +1992,13 @@ void quitRockMode() {
     std::printf("Leaving rocking mode and returning home.\n");
 }
 
-void setWalkLegPhase(WalkLegState& leg, std::uint8_t phase) {
-    leg.phase = phase % 4;
-    switch (leg.phase) {
-        case 0: leg.short_leg = true; break;
-        case 1: leg.x_mm = +g_walk_legx_mm; break;
-        case 2: leg.short_leg = false; break;
-        case 3: leg.x_mm = -g_walk_legx_mm; break;
+const char* walkSwingName(WalkSwing swing) {
+    switch (swing) {
+        case WalkSwing::LEFT: return "L";
+        case WalkSwing::RIGHT: return "R";
+        case WalkSwing::NONE: return "--";
     }
+    return "--";
 }
 
 bool walkLegWithinLimits(tilt::Leg leg, float theta[3]) {
@@ -2006,24 +2016,39 @@ bool walkLegWithinLimits(tilt::Leg leg, float theta[3]) {
     return false;
 }
 
-bool buildWalkTarget(float delta_bias_mm,
-                     float target[tilt::NUM_JOINTS]) {
-    const float signed_delta_mm =
-        g_walk_left.short_leg ? +g_walk_delta_mm : -g_walk_delta_mm;
-    const float applied_delta_mm = signed_delta_mm + delta_bias_mm;
-    if (std::fabs(applied_delta_mm) > tilt_pose_test::kRockDeltaMaxMm) {
-        std::printf("Walk target rejected: applied delta %+.1fmm exceeds limit "
-                    "±%.1fmm.\n",
-                    applied_delta_mm, tilt_pose_test::kRockDeltaMaxMm);
+bool buildWalkTarget(float target[tilt::NUM_JOINTS]) {
+    if (std::fabs(g_walk_signed_delta_mm) >
+        tilt_pose_test::kRockDeltaMaxMm) {
+        std::printf("Walk target rejected: delta %+.1fmm exceeds limit ±%.1fmm.\n",
+                    g_walk_signed_delta_mm, tilt_pose_test::kRockDeltaMaxMm);
         return false;
     }
 
-    const float left_height = g_walk_base_height_mm - applied_delta_mm * 0.5f;
-    const float right_height = g_walk_base_height_mm + applied_delta_mm * 0.5f;
-    const float common_foot_x =
-        g_pitch_comp_enabled ? -g_comp_body_x_mm : 0.0f;
-    const float left_x = g_walk_left.x_mm + common_foot_x;
-    const float right_x = g_walk_right.x_mm + common_foot_x;
+    const float left_lift_mm =
+        g_walk_swing == WalkSwing::LEFT ? g_walk_lift_mm : 0.0f;
+    const float right_lift_mm =
+        g_walk_swing == WalkSwing::RIGHT ? g_walk_lift_mm : 0.0f;
+    const float left_height =
+        g_walk_base_height_mm - g_walk_signed_delta_mm * 0.5f - left_lift_mm;
+    const float right_height =
+        g_walk_base_height_mm + g_walk_signed_delta_mm * 0.5f - right_lift_mm;
+    if ((left_lift_mm > 0.0f &&
+         left_height < tilt_pose_test::kBodyHeightMinMm) ||
+        (right_lift_mm > 0.0f &&
+         right_height < tilt_pose_test::kBodyHeightMinMm)) {
+        const bool left_low = left_lift_mm > 0.0f;
+        std::printf("Walk swing skipped: lift makes %s height %.2fmm lower than "
+                    "workspace minimum %.2fmm.\n",
+                    left_low ? "LEFT" : "RIGHT",
+                    left_low ? left_height : right_height,
+                    tilt_pose_test::kBodyHeightMinMm);
+        return false;
+    }
+
+    const float body_x_comp =
+        g_pitch_comp_enabled ? g_comp_body_x_mm : 0.0f;
+    const float left_x = g_walk_left_x_mm - body_x_comp;
+    const float right_x = g_walk_right_x_mm - body_x_comp;
     const tilt::Vec3 left_target{left_x, +tilt::Y_HIP_MM, -left_height};
     const tilt::Vec3 right_target{right_x, -tilt::Y_HIP_MM, -right_height};
     tilt::IkResult left = tilt::ik_foot(tilt::Leg::LEFT, left_target, 0.0f);
@@ -2047,24 +2072,43 @@ bool buildWalkTarget(float delta_bias_mm,
         return false;
     }
 
-    g_walk_applied_delta_mm = applied_delta_mm;
     g_walk_last_left_x_mm = left_x;
     g_walk_last_right_x_mm = right_x;
     g_walk_last_left_height_mm = left_height;
     g_walk_last_right_height_mm = right_height;
+    g_walk_last_applied_body_x_mm = body_x_comp;
     return true;
 }
 
 bool applyWalkTarget() {
     float target[tilt::NUM_JOINTS]{};
-    const float bias_mm = g_rock_center_comp_enabled
-                              ? g_rock_delta_bias_mm
-                              : 0.0f;
-    if (!buildWalkTarget(bias_mm, target) ||
-        !beginMove(target, g_walk_leg_time_ms)) {
+    if (!buildWalkTarget(target) ||
+        !beginMove(target, tilt_pose_test::kMinMoveDurationMs)) {
         return false;
     }
     return true;
+}
+
+bool walkImuReady() {
+    return g_imu_available && g_roll_valid && g_pitch_valid &&
+           g_imu_consecutive_failures < 5;
+}
+
+void noteWalkTargetResult(bool accepted) {
+    if (accepted) {
+        g_walk_stats.consecutive_rejects = 0;
+        return;
+    }
+    ++g_walk_stats.rejected_targets;
+    ++g_walk_stats.consecutive_rejects;
+    std::printf("Walk target held (%lu/%lu consecutive rejects).\n",
+                static_cast<unsigned long>(g_walk_stats.consecutive_rejects),
+                static_cast<unsigned long>(
+                    tilt_pose_test::kWalkMaxConsecutiveRejects));
+    if (g_walk_stats.consecutive_rejects >=
+        tilt_pose_test::kWalkMaxConsecutiveRejects) {
+        stopWalkMotion("three consecutive targets rejected", true);
+    }
 }
 
 void sampleWalkAttitude() {
@@ -2080,16 +2124,6 @@ void sampleWalkAttitude() {
         } else {
             g_walk_stats.roll_min_deg = std::fmin(g_walk_stats.roll_min_deg, value_deg);
             g_walk_stats.roll_max_deg = std::fmax(g_walk_stats.roll_max_deg, value_deg);
-        }
-        if (!g_walk_stats.cycle_roll_valid) {
-            g_walk_stats.cycle_roll_valid = true;
-            g_walk_stats.cycle_roll_min_deg = value_deg;
-            g_walk_stats.cycle_roll_max_deg = value_deg;
-        } else {
-            g_walk_stats.cycle_roll_min_deg =
-                std::fmin(g_walk_stats.cycle_roll_min_deg, value_deg);
-            g_walk_stats.cycle_roll_max_deg =
-                std::fmax(g_walk_stats.cycle_roll_max_deg, value_deg);
         }
     }
     if (currentRelativePitch(value_deg)) {
@@ -2107,85 +2141,72 @@ void sampleWalkAttitude() {
 }
 
 void printWalkState() {
-    float roll_deg = 0.0f;
-    float pitch_deg = 0.0f;
-    const bool roll_valid = currentRelativeRoll(roll_deg);
-    const bool pitch_valid = currentRelativePitch(pitch_deg);
-    std::printf("[WALK %s] legx=%+.1f delta=%.1f base=%.2f leg_t=%lums "
-                "pitch_comp=%s center=%s bias=%+.1f | roll=",
-                g_walk_running.load() ? "RUN" : "STOP",
-                g_walk_legx_mm, g_walk_delta_mm, g_walk_base_height_mm,
-                static_cast<unsigned long>(g_walk_leg_time_ms),
-                g_pitch_comp_enabled ? "ON" : "OFF",
-                g_rock_center_comp_enabled ? "ON" : "OFF",
-                g_rock_delta_bias_mm);
-    if (roll_valid) std::printf("%+.1f", roll_deg);
+    float relative_roll_deg = 0.0f;
+    float relative_pitch_deg = 0.0f;
+    const bool relative_roll_valid = currentRelativeRoll(relative_roll_deg);
+    const bool relative_pitch_valid = currentRelativePitch(relative_pitch_deg);
+    std::printf("[WALK %s] delta=%.1f lift=%.1f legx=%+.1f base=%.2f period=%lums\n"
+                "  roll trigger=±%.2fdeg release=±%.2fdeg swing %lu~%lums\n"
+                "  comp pitch=%s(Kp%.1f)\n"
+                "  IMU roll=",
+                g_walk_running.load() ? "running" : "stopped",
+                g_walk_delta_mm, g_walk_lift_mm, g_walk_legx_mm,
+                g_walk_base_height_mm,
+                static_cast<unsigned long>(g_walk_rock_period_ms),
+                g_walk_roll_trigger_deg, tilt_pose_test::kWalkRollReleaseDeg,
+                static_cast<unsigned long>(tilt_pose_test::kWalkSwingMinMs),
+                static_cast<unsigned long>(tilt_pose_test::kWalkSwingMaxMs),
+                g_pitch_comp_enabled ? "ON" : "OFF", g_comp_kp_pitch);
+    if (g_roll_valid) std::printf("%+.1f", g_roll_deg);
     else std::printf("--");
+    std::printf(" (rel ");
+    if (relative_roll_valid) std::printf("%+.1f)", relative_roll_deg);
+    else std::printf("--)");
     std::printf(" pitch=");
-    if (pitch_valid) std::printf("%+.1f", pitch_deg);
+    if (g_pitch_valid) std::printf("%+.1f", g_pitch_deg);
     else std::printf("--");
-    std::printf(" body_x=%+.1f\n", g_comp_body_x_mm);
+    std::printf(" (rel ");
+    if (relative_pitch_valid) std::printf("%+.1f)\n", relative_pitch_deg);
+    else std::printf("--)\n");
 }
 
-void printWalkCycle(bool cycle_roll_valid, float cycle_roll_min_deg,
-                    float cycle_roll_max_deg) {
+void printWalkTransition(WalkSwing swing, float relative_roll_deg,
+                         std::uint32_t duration_ms) {
     float relative_pitch_deg = 0.0f;
     const bool pitch_valid = currentRelativePitch(relative_pitch_deg);
-    std::printf("walk#%lu legx=%+.1f delta=%.1f base=%.2f leg_t=%lums | "
-                "L(x%+.1f z%.2f) R(x%+.1f z%.2f) | roll=",
-                static_cast<unsigned long>(g_walk_stats.cycles),
-                g_walk_legx_mm, g_walk_delta_mm, g_walk_base_height_mm,
-                static_cast<unsigned long>(g_walk_leg_time_ms),
-                g_walk_last_left_x_mm, g_walk_last_left_height_mm,
-                g_walk_last_right_x_mm, g_walk_last_right_height_mm);
-    if (cycle_roll_valid) {
-        const float mid_deg = (cycle_roll_min_deg + cycle_roll_max_deg) * 0.5f;
-        const float amp_deg = (cycle_roll_max_deg - cycle_roll_min_deg) * 0.5f;
-        std::printf("%+.1f(amp%.1f)", mid_deg, amp_deg);
-    } else {
-        std::printf("--(amp--)");
+    std::printf("sw#%lu SWING=%s roll=%+.1f",
+                static_cast<unsigned long>(g_walk_stats.swing_count),
+                walkSwingName(swing), relative_roll_deg);
+    if (swing != WalkSwing::NONE) {
+        const float signed_trigger = swing == WalkSwing::RIGHT
+                                         ? +g_walk_roll_trigger_deg
+                                         : -g_walk_roll_trigger_deg;
+        std::printf("(trig%+.2f) lift=%.1f legx=%.1f delta=%+.1f | "
+                    "L(x%+.1f z%.2f) R(x%+.1f z%.2f) |",
+                    signed_trigger, g_walk_lift_mm, g_walk_legx_mm,
+                    g_walk_signed_delta_mm,
+                    g_walk_last_left_x_mm, g_walk_last_left_height_mm,
+                    g_walk_last_right_x_mm, g_walk_last_right_height_mm);
     }
-    std::printf(" pitch=");
-    if (pitch_valid) std::printf("%+.1f", relative_pitch_deg);
-    else std::printf("--");
-    std::printf(" body_x=%+.1f\n", g_comp_body_x_mm);
-}
-
-void finishWalkCycle() {
-    const bool roll_valid = g_walk_stats.cycle_roll_valid;
-    const float roll_min_deg = g_walk_stats.cycle_roll_min_deg;
-    const float roll_max_deg = g_walk_stats.cycle_roll_max_deg;
-    if (roll_valid && g_rock_center_comp_enabled) {
-        const float roll_mid_deg = (roll_min_deg + roll_max_deg) * 0.5f;
-        const float candidate_bias_mm = std::fmax(
-            -tilt_pose_test::kCompDeltaBiasMaxMm,
-            std::fmin(tilt_pose_test::kCompDeltaBiasMaxMm,
-                      g_rock_delta_bias_mm -
-                          tilt_pose_test::kCompKrCenterDefault * roll_mid_deg));
-        float candidate_target[tilt::NUM_JOINTS]{};
-        if (buildWalkTarget(candidate_bias_mm, candidate_target)) {
-            g_rock_delta_bias_mm = candidate_bias_mm;
-        } else {
-            std::printf("Walk center compensation update cancelled: target rejected.\n");
-        }
+    std::printf(" dur=%lums", static_cast<unsigned long>(duration_ms));
+    if (swing != WalkSwing::NONE) {
+        std::printf(" pitch=");
+        if (pitch_valid) std::printf("%+.1f", relative_pitch_deg);
+        else std::printf("--");
     }
-    ++g_walk_stats.cycles;
-    g_walk_stats.cycle_roll_valid = false;
-    g_walk_last_cycle_roll_valid = roll_valid;
-    g_walk_last_cycle_roll_min_deg = roll_min_deg;
-    g_walk_last_cycle_roll_max_deg = roll_max_deg;
+    std::printf("\n");
 }
 
 void printWalkSummary() {
     sampleWalkAttitude();
     std::printf("\n── walk 결과 ──\n"
-                "  legx %.1fmm, delta %.1fmm, leg_time %lums, %lu 사이클\n"
-                "  보상: pitch=%s(Kp%.1f) roll중심=%s\n\n",
-                g_walk_summary_legx_mm, g_walk_summary_delta_mm,
-                static_cast<unsigned long>(g_walk_summary_leg_time_ms),
-                static_cast<unsigned long>(g_walk_stats.cycles),
-                g_pitch_comp_enabled ? "ON" : "OFF", g_comp_kp_pitch,
-                g_rock_center_comp_enabled ? "ON" : "OFF");
+                "  delta %.1fmm, lift %.1fmm, legx %.1fmm, period %lums, base %.2f\n"
+                "  roll trigger ±%.2fdeg, %lu 스윙 전이\n\n",
+                g_walk_summary_delta_mm, g_walk_summary_lift_mm,
+                g_walk_summary_legx_mm,
+                static_cast<unsigned long>(g_walk_summary_period_ms),
+                g_walk_summary_base_height_mm, g_walk_summary_trigger_deg,
+                static_cast<unsigned long>(g_walk_stats.swing_count));
     float roll_peak_to_peak = 0.0f;
     if (g_walk_stats.roll_valid) {
         roll_peak_to_peak =
@@ -2209,16 +2230,48 @@ void printWalkSummary() {
     } else {
         std::printf("  pitch 잔차: --\n");
     }
-    std::printf("  거부된 스텝: %lu회\n"
-                "  body_x 사용 범위: %+.1f ~ %+.1f mm (한계 ±%.1f)\n",
-                static_cast<unsigned long>(g_walk_stats.rejected_steps),
-                g_comp_body_x_min_mm, g_comp_body_x_max_mm,
-                tilt_pose_test::kCompBodyXMaxMm);
-    if (g_walk_stats.roll_valid && roll_peak_to_peak * 0.5f < 9.5f) {
-        std::printf("\n  참고: 발이 뜨지 않고 끌리는 경우\n"
-                    "    - 현재 발판 안쪽 가장자리 y = 18.2mm, 필요 실제 roll ≈ 9.5deg\n"
-                    "    - 실측 roll 진폭이 그보다 작으면 발은 뜨지 않는다\n"
-                    "    - 발판을 안쪽으로 10mm 넓히면 필요 roll 이 약 4.3deg로 낮아진다\n");
+    const std::uint64_t left_average_ms = g_walk_stats.left_swings == 0
+        ? 0 : g_walk_stats.left_duration_total_ms / g_walk_stats.left_swings;
+    const std::uint64_t right_average_ms = g_walk_stats.right_swings == 0
+        ? 0 : g_walk_stats.right_duration_total_ms / g_walk_stats.right_swings;
+    std::printf("\n  스윙 통계\n"
+                "    LEFT  스윙 %lu회, 평균 지속 %llums\n"
+                "    RIGHT 스윙 %lu회, 평균 지속 %llums\n"
+                "    최대시간 강제해제: %lu회\n"
+                "    최소시간 미달 억제: %lu회\n"
+                "  거부된 목표: %lu회\n\n"
+                "  전진량은 바닥 표시로 직접 재고 %lu 로 나누면 "
+                "스윙당 전진량이 나옵니다.\n",
+                static_cast<unsigned long>(g_walk_stats.left_swings),
+                static_cast<unsigned long long>(left_average_ms),
+                static_cast<unsigned long>(g_walk_stats.right_swings),
+                static_cast<unsigned long long>(right_average_ms),
+                static_cast<unsigned long>(g_walk_stats.forced_releases),
+                static_cast<unsigned long>(g_walk_stats.min_time_suppressions),
+                static_cast<unsigned long>(g_walk_stats.rejected_targets),
+                static_cast<unsigned long>(g_walk_stats.swing_count));
+    if (g_walk_stats.roll_valid &&
+        roll_peak_to_peak * 0.5f < g_walk_summary_trigger_deg) {
+        std::printf("주의: roll 진폭이 트리거 임계보다 작아 스윙이 거의 발생하지 않습니다.\n"
+                    "      ; 로 임계를 낮추거나 delta 를 키우세요.\n");
+    }
+    if (g_walk_stats.swing_count > 0 &&
+        g_walk_stats.forced_releases * 10 >=
+            g_walk_stats.swing_count * 3) {
+        std::printf("주의: 최대시간 강제해제가 잦습니다. roll 이 제때 돌아오지 않습니다.\n"
+                    "      rocking 주기를 늘리거나 임계를 높여보세요.\n");
+    }
+}
+
+void finishWalkSwing(WalkSwing swing, std::uint32_t now) {
+    if (swing == WalkSwing::NONE) {
+        return;
+    }
+    const std::uint32_t duration_ms = now - g_walk_swing_started_ms;
+    if (swing == WalkSwing::LEFT) {
+        g_walk_stats.left_duration_total_ms += duration_ms;
+    } else {
+        g_walk_stats.right_duration_total_ms += duration_ms;
     }
 }
 
@@ -2226,14 +2279,22 @@ void stopWalkMotion(const char* reason, bool return_home) {
     if (!g_walk_running.exchange(false)) {
         return;
     }
+    finishWalkSwing(g_walk_swing, nowMs());
     g_walk_summary_legx_mm = g_walk_legx_mm;
+    g_walk_summary_lift_mm = g_walk_lift_mm;
     g_walk_summary_delta_mm = g_walk_delta_mm;
-    g_walk_summary_leg_time_ms = g_walk_leg_time_ms;
+    g_walk_summary_base_height_mm = g_walk_base_height_mm;
+    g_walk_summary_trigger_deg = g_walk_roll_trigger_deg;
+    g_walk_summary_period_ms = g_walk_rock_period_ms;
     g_interpolator.abort();
     g_walk_legx_mm = 0.0f;
+    g_walk_lift_mm = 0.0f;
     g_walk_delta_mm = 0.0f;
-    g_walk_left.x_mm = 0.0f;
-    g_walk_right.x_mm = 0.0f;
+    g_walk_signed_delta_mm = 0.0f;
+    g_walk_left_x_mm = 0.0f;
+    g_walk_right_x_mm = 0.0f;
+    g_walk_swing = WalkSwing::NONE;
+    g_walk_target_dirty = false;
     std::printf("Walk stopped: %s.\n", reason);
     if (return_home && g_state.load() == SafetyState::ARMED) {
         beginMove(tilt::ZERO_POSE_RAD, tilt_pose_test::kPoseDurationMs);
@@ -2244,29 +2305,35 @@ void startWalkMotion() {
     if (!g_walk_ready.load() || g_walk_running.load()) {
         return;
     }
-    g_walk_stats.transitions = 0;
-    g_walk_stats.consecutive_rejects = 0;
-    g_walk_stats.cycle_roll_valid = false;
-    g_walk_left = {};
-    g_walk_right = {};
-    setWalkLegPhase(g_walk_left, 0);
-    setWalkLegPhase(g_walk_right, 2);
-    g_walk_running.store(true);
-    std::printf("전진량은 바닥에 표시를 두고 눈으로 재세요. 사이클 수가 출력되므로\n"
-                "(이동거리 / 사이클 수) 로 스텝당 전진량을 계산할 수 있습니다.\n");
-    if (!applyWalkTarget()) {
-        ++g_walk_stats.rejected_steps;
-        ++g_walk_stats.consecutive_rejects;
-        std::printf("Walk initial step skipped (1/%lu consecutive rejects).\n",
-                    static_cast<unsigned long>(
-                        tilt_pose_test::kWalkMaxConsecutiveRejects));
+    if (!walkImuReady() || !g_roll_zero_valid || !g_pitch_zero_valid) {
+        std::printf("Walk start rejected: valid IMU roll/pitch and zero reference "
+                    "are required.\n");
+        return;
     }
-    g_walk_next_action_ms = nowMs() + g_walk_leg_time_ms;
+    g_walk_stats.consecutive_rejects = 0;
+    g_walk_swing = WalkSwing::NONE;
+    g_walk_signed_delta_mm = g_walk_delta_mm;
+    g_walk_left_x_mm = 0.0f;
+    g_walk_right_x_mm = 0.0f;
+    g_walk_trigger_armed = true;
+    g_walk_min_suppression_counted = false;
+    g_walk_target_dirty = false;
+    g_walk_last_applied_body_x_mm = 0.0f;
+    const std::uint32_t now = nowMs();
+    g_walk_next_rock_ms = now + g_walk_rock_period_ms;
+    g_walk_last_transition_ms = now;
+    g_walk_running.store(true);
+    std::printf("전진량은 바닥 표시로 직접 재고 스윙 전이 수로 나누세요.\n");
+    noteWalkTargetResult(applyWalkTarget());
     std::printf("Walk started.\n");
 }
 
 void requestWalkMode() {
     if (!isArmed("walk")) {
+        return;
+    }
+    if (!walkImuReady()) {
+        std::printf("Walk entry rejected: MPU6050 roll/pitch is unavailable.\n");
         return;
     }
     std::printf("\nWALK SAFETY: 바닥에 세우고 손을 받칠 준비를 하세요.\n"
@@ -2280,17 +2347,32 @@ void confirmWalkMode() {
         g_walk_confirmation_pending.store(false);
         return;
     }
+    if (!walkImuReady()) {
+        g_walk_confirmation_pending.store(false);
+        std::printf("Walk entry rejected: MPU6050 became unavailable.\n");
+        return;
+    }
     g_walk_confirmation_pending.store(false);
     g_walk_mode.store(true);
     g_walk_ready.store(false);
     g_walk_running.store(false);
-    g_walk_legx_mm = 0.0f;
+    g_walk_legx_mm = tilt_pose_test::kWalkLegxDefaultMm;
+    g_walk_lift_mm = tilt_pose_test::kWalkLiftDefaultMm;
     g_walk_delta_mm = tilt_pose_test::kWalkDeltaDefaultMm;
     g_walk_base_height_mm = tilt::ZERO_POSE_HEIGHT_MM;
-    g_walk_leg_time_ms = tilt_pose_test::kWalkLegTimeDefaultMs;
+    g_walk_roll_trigger_deg = tilt_pose_test::kWalkRollTriggerDeg;
+    g_walk_rock_period_ms = tilt_pose_test::kWalkRockPeriodMs;
+    g_walk_signed_delta_mm = g_walk_delta_mm;
+    g_walk_swing = WalkSwing::NONE;
+    g_walk_left_x_mm = 0.0f;
+    g_walk_right_x_mm = 0.0f;
+    g_walk_target_dirty = false;
     g_walk_summary_legx_mm = 0.0f;
+    g_walk_summary_lift_mm = 0.0f;
     g_walk_summary_delta_mm = g_walk_delta_mm;
-    g_walk_summary_leg_time_ms = g_walk_leg_time_ms;
+    g_walk_summary_base_height_mm = g_walk_base_height_mm;
+    g_walk_summary_trigger_deg = g_walk_roll_trigger_deg;
+    g_walk_summary_period_ms = g_walk_rock_period_ms;
     g_walk_stats = {};
     g_pitch_comp_enabled = false;
     g_rock_center_comp_enabled = false;
@@ -2328,42 +2410,120 @@ void quitWalkMode() {
 
 void serviceWalk() {
     if (!g_walk_running.load() || !g_walk_ready.load() ||
-        g_state.load() != SafetyState::ARMED || g_interpolator.isBusy()) {
+        g_state.load() != SafetyState::ARMED) {
         return;
     }
     const std::uint32_t now = nowMs();
-    if (static_cast<std::int32_t>(now - g_walk_next_action_ms) < 0) {
+    float relative_roll_deg = 0.0f;
+    if (!currentRelativeRoll(relative_roll_deg)) {
         return;
     }
 
-    setWalkLegPhase(g_walk_left, g_walk_left.phase + 1);
-    setWalkLegPhase(g_walk_right, g_walk_right.phase + 1);
-    ++g_walk_stats.transitions;
-    const bool cycle_complete = (g_walk_stats.transitions % 4) == 0;
-    if (cycle_complete) {
-        finishWalkCycle();
-    }
-    if (!applyWalkTarget()) {
-        ++g_walk_stats.rejected_steps;
-        ++g_walk_stats.consecutive_rejects;
-        std::printf("Walk step skipped (%lu/%lu consecutive rejects).\n",
-                    static_cast<unsigned long>(g_walk_stats.consecutive_rejects),
-                    static_cast<unsigned long>(
-                        tilt_pose_test::kWalkMaxConsecutiveRejects));
-        if (g_walk_stats.consecutive_rejects >=
-            tilt_pose_test::kWalkMaxConsecutiveRejects) {
-            stopWalkMotion("three consecutive targets rejected", true);
-            return;
+    const WalkSwing previous_swing = g_walk_swing;
+    WalkSwing desired_swing = previous_swing;
+    bool forced_release = false;
+    if (previous_swing == WalkSwing::NONE) {
+        if (!g_walk_trigger_armed &&
+            std::fabs(relative_roll_deg) <
+                tilt_pose_test::kWalkRollReleaseDeg) {
+            g_walk_trigger_armed = true;
+        }
+        if (g_walk_trigger_armed) {
+            if (relative_roll_deg > g_walk_roll_trigger_deg) {
+                desired_swing = WalkSwing::RIGHT;
+            } else if (relative_roll_deg < -g_walk_roll_trigger_deg) {
+                desired_swing = WalkSwing::LEFT;
+            }
         }
     } else {
-        g_walk_stats.consecutive_rejects = 0;
+        const std::uint32_t swing_duration_ms = now - g_walk_swing_started_ms;
+        if (swing_duration_ms >= tilt_pose_test::kWalkSwingMaxMs) {
+            desired_swing = WalkSwing::NONE;
+            forced_release = true;
+        } else if (std::fabs(relative_roll_deg) <
+                   tilt_pose_test::kWalkRollReleaseDeg) {
+            if (swing_duration_ms >= tilt_pose_test::kWalkSwingMinMs) {
+                desired_swing = WalkSwing::NONE;
+            } else if (!g_walk_min_suppression_counted) {
+                ++g_walk_stats.min_time_suppressions;
+                g_walk_min_suppression_counted = true;
+            }
+        }
     }
-    if (cycle_complete) {
-        printWalkCycle(g_walk_last_cycle_roll_valid,
-                       g_walk_last_cycle_roll_min_deg,
-                       g_walk_last_cycle_roll_max_deg);
+
+    const bool rock_due =
+        static_cast<std::int32_t>(now - g_walk_next_rock_ms) >= 0;
+    const float previous_signed_delta_mm = g_walk_signed_delta_mm;
+    const float previous_left_x_mm = g_walk_left_x_mm;
+    const float previous_right_x_mm = g_walk_right_x_mm;
+    if (rock_due) {
+        g_walk_signed_delta_mm = -g_walk_signed_delta_mm;
+        g_walk_next_rock_ms = now + g_walk_rock_period_ms;
     }
-    g_walk_next_action_ms = now + g_walk_leg_time_ms;
+
+    const bool swing_changed = desired_swing != previous_swing;
+    if (swing_changed) {
+        g_walk_swing = desired_swing;
+        if (desired_swing == WalkSwing::LEFT) {
+            g_walk_left_x_mm = +g_walk_legx_mm;
+            g_walk_right_x_mm = -g_walk_legx_mm;
+        } else if (desired_swing == WalkSwing::RIGHT) {
+            g_walk_left_x_mm = -g_walk_legx_mm;
+            g_walk_right_x_mm = +g_walk_legx_mm;
+        }
+    }
+
+    const bool pitch_update = g_pitch_comp_enabled &&
+        !g_interpolator.isBusy() &&
+        std::fabs(g_comp_body_x_mm - g_walk_last_applied_body_x_mm) > 0.05f;
+    if (!swing_changed && !rock_due && !g_walk_target_dirty && !pitch_update) {
+        return;
+    }
+
+    if (!applyWalkTarget()) {
+        g_walk_swing = previous_swing;
+        g_walk_signed_delta_mm = previous_signed_delta_mm;
+        g_walk_left_x_mm = previous_left_x_mm;
+        g_walk_right_x_mm = previous_right_x_mm;
+        if (swing_changed && previous_swing == WalkSwing::NONE) {
+            // Skip this swing and wait for roll to return through the release band.
+            g_walk_trigger_armed = false;
+        }
+        noteWalkTargetResult(false);
+        return;
+    }
+    noteWalkTargetResult(true);
+    g_walk_target_dirty = false;
+
+    if (swing_changed) {
+        const std::uint32_t transition_interval_ms = now - g_walk_last_transition_ms;
+        if (previous_swing != WalkSwing::NONE) {
+            const std::uint32_t swing_duration_ms = now - g_walk_swing_started_ms;
+            finishWalkSwing(previous_swing, now);
+            if (forced_release) {
+                ++g_walk_stats.forced_releases;
+                g_walk_trigger_armed = false;
+            } else {
+                g_walk_trigger_armed = true;
+            }
+            printWalkTransition(WalkSwing::NONE, relative_roll_deg,
+                                swing_duration_ms);
+        }
+        if (desired_swing != WalkSwing::NONE) {
+            ++g_walk_stats.swing_count;
+            if (desired_swing == WalkSwing::LEFT) {
+                ++g_walk_stats.left_swings;
+            } else {
+                ++g_walk_stats.right_swings;
+            }
+            g_walk_swing_started_ms = now;
+            g_walk_min_suppression_counted = false;
+            g_walk_trigger_armed = false;
+            printWalkTransition(desired_swing, relative_roll_deg,
+                                transition_interval_ms);
+        }
+        g_walk_last_transition_ms = now;
+    }
 }
 
 void serviceRockAutomation() {
@@ -2492,11 +2652,18 @@ void serviceMotion() {
                 std::printf("Rock automation stopped: joint speed guard.\n");
             }
             if (g_walk_running.exchange(false)) {
+                finishWalkSwing(g_walk_swing, nowMs());
                 g_walk_summary_legx_mm = g_walk_legx_mm;
+                g_walk_summary_lift_mm = g_walk_lift_mm;
                 g_walk_summary_delta_mm = g_walk_delta_mm;
-                g_walk_summary_leg_time_ms = g_walk_leg_time_ms;
+                g_walk_summary_base_height_mm = g_walk_base_height_mm;
+                g_walk_summary_trigger_deg = g_walk_roll_trigger_deg;
+                g_walk_summary_period_ms = g_walk_rock_period_ms;
                 g_walk_legx_mm = 0.0f;
+                g_walk_lift_mm = 0.0f;
                 g_walk_delta_mm = 0.0f;
+                g_walk_signed_delta_mm = 0.0f;
+                g_walk_swing = WalkSwing::NONE;
                 std::printf("Walk stopped: joint speed guard.\n");
             }
 
@@ -2574,7 +2741,7 @@ void serviceMotion() {
             if (g_pitch_zero_valid) g_pitch_zero_deg = g_pitch_deg;
             g_walk_ready.store(true);
             std::printf("Walk mode ready and stopped: press space to start. "
-                        "legx begins at 0.0mm; q exits, ! E-STOP.\n");
+                        "lift and legx begin at 0.0mm; q exits, ! E-STOP.\n");
             printWalkState();
         }
     }
@@ -2803,6 +2970,15 @@ void handleCommand(const Command& command) {
                     -tilt_pose_test::kWalkLegxMaxMm,
                     std::fmin(tilt_pose_test::kWalkLegxMaxMm,
                               g_walk_legx_mm + change));
+                if (g_walk_swing == WalkSwing::LEFT) {
+                    g_walk_left_x_mm = +g_walk_legx_mm;
+                    g_walk_right_x_mm = -g_walk_legx_mm;
+                    g_walk_target_dirty = true;
+                } else if (g_walk_swing == WalkSwing::RIGHT) {
+                    g_walk_left_x_mm = -g_walk_legx_mm;
+                    g_walk_right_x_mm = +g_walk_legx_mm;
+                    g_walk_target_dirty = true;
+                }
                 std::printf("Walk legx=%+.1fmm.\n", g_walk_legx_mm);
             }
             return;
@@ -2816,6 +2992,7 @@ void handleCommand(const Command& command) {
                     tilt_pose_test::kBodyHeightMinMm,
                     std::fmin(tilt_pose_test::kBodyHeightMaxMm,
                               g_walk_base_height_mm + change));
+                g_walk_target_dirty = true;
                 std::printf("Walk base height=%.2fmm.\n", g_walk_base_height_mm);
             }
             return;
@@ -2823,10 +3000,16 @@ void handleCommand(const Command& command) {
         case CommandType::WALK_DELTA_DOWN:
             if (g_walk_ready.load()) {
                 const float change = command.type == CommandType::WALK_DELTA_UP
-                                         ? 1.0f : -1.0f;
+                                         ? tilt_pose_test::kWalkDeltaStepMm
+                                         : -tilt_pose_test::kWalkDeltaStepMm;
                 g_walk_delta_mm = std::fmax(
                     0.0f, std::fmin(tilt_pose_test::kRockDeltaMaxMm,
                                     g_walk_delta_mm + change));
+                g_walk_signed_delta_mm = std::copysign(
+                    g_walk_delta_mm,
+                    g_walk_signed_delta_mm == 0.0f ? 1.0f
+                                                   : g_walk_signed_delta_mm);
+                g_walk_target_dirty = true;
                 std::printf("Walk delta=%.1fmm.\n", g_walk_delta_mm);
             }
             return;
@@ -2834,28 +3017,64 @@ void handleCommand(const Command& command) {
         case CommandType::WALK_PERIOD_UP:
             if (g_walk_ready.load()) {
                 const int change = command.type == CommandType::WALK_PERIOD_UP
-                                       ? static_cast<int>(tilt_pose_test::kWalkLegTimeStepMs)
-                                       : -static_cast<int>(tilt_pose_test::kWalkLegTimeStepMs);
-                const int requested = static_cast<int>(g_walk_leg_time_ms) + change;
+                                       ? static_cast<int>(tilt_pose_test::kWalkRockPeriodStepMs)
+                                       : -static_cast<int>(tilt_pose_test::kWalkRockPeriodStepMs);
+                const int requested = static_cast<int>(g_walk_rock_period_ms) + change;
                 const int bounded = std::max(
-                    static_cast<int>(tilt_pose_test::kWalkLegTimeMinMs),
-                    std::min(static_cast<int>(tilt_pose_test::kWalkLegTimeMaxMs),
+                    static_cast<int>(tilt_pose_test::kWalkRockPeriodMinMs),
+                    std::min(static_cast<int>(tilt_pose_test::kWalkRockPeriodMaxMs),
                              requested));
-                g_walk_leg_time_ms = static_cast<std::uint32_t>(bounded);
-                std::printf("Walk leg_time=%lums.\n",
-                            static_cast<unsigned long>(g_walk_leg_time_ms));
+                g_walk_rock_period_ms = static_cast<std::uint32_t>(bounded);
+                if (g_walk_running.load()) {
+                    g_walk_next_rock_ms = nowMs() + g_walk_rock_period_ms;
+                }
+                std::printf("Walk rocking period=%lums.\n",
+                            static_cast<unsigned long>(g_walk_rock_period_ms));
+            }
+            return;
+        case CommandType::WALK_LIFT_UP:
+        case CommandType::WALK_LIFT_DOWN:
+            if (g_walk_ready.load()) {
+                const float change = command.type == CommandType::WALK_LIFT_UP
+                                         ? tilt_pose_test::kWalkLiftStepMm
+                                         : -tilt_pose_test::kWalkLiftStepMm;
+                g_walk_lift_mm = std::fmax(
+                    0.0f, std::fmin(tilt_pose_test::kWalkLiftMaxMm,
+                                    g_walk_lift_mm + change));
+                if (g_walk_swing != WalkSwing::NONE) {
+                    g_walk_target_dirty = true;
+                }
+                std::printf("Walk lift=%.1fmm.\n", g_walk_lift_mm);
+            }
+            return;
+        case CommandType::WALK_TRIGGER_DOWN:
+        case CommandType::WALK_TRIGGER_UP:
+            if (g_walk_ready.load()) {
+                const float change = command.type == CommandType::WALK_TRIGGER_UP
+                    ? tilt_pose_test::kWalkRollTriggerStepDeg
+                    : -tilt_pose_test::kWalkRollTriggerStepDeg;
+                g_walk_roll_trigger_deg = std::fmax(
+                    tilt_pose_test::kWalkRollReleaseDeg + 0.05f,
+                    std::fmin(tilt_pose_test::kCompAbortRollDeg,
+                              g_walk_roll_trigger_deg + change));
+                std::printf("Walk roll trigger=±%.2fdeg.\n",
+                            g_walk_roll_trigger_deg);
             }
             return;
         case CommandType::WALK_TOGGLE_PITCH_COMP:
-            if (g_walk_ready.load()) togglePitchCompensation();
-            return;
-        case CommandType::WALK_TOGGLE_CENTER_COMP:
-            if (g_walk_ready.load()) toggleRockCenterCompensation();
-            return;
-        case CommandType::WALK_ZERO_X:
             if (g_walk_ready.load()) {
+                togglePitchCompensation();
+                g_walk_target_dirty = true;
+            }
+            return;
+        case CommandType::WALK_ZERO:
+            if (g_walk_ready.load()) {
+                g_walk_lift_mm = 0.0f;
                 g_walk_legx_mm = 0.0f;
-                std::printf("Walk legx reset to 0.0mm.\n");
+                g_walk_left_x_mm = 0.0f;
+                g_walk_right_x_mm = 0.0f;
+                g_walk_target_dirty = true;
+                std::printf("Walk lift and legx reset to 0.0mm.\n");
             }
             return;
         case CommandType::WALK_RESET_ATTITUDE:
@@ -2986,13 +3205,16 @@ void enqueueWalkKey(std::uint8_t key) {
         case 's': case 'S': type = CommandType::WALK_DOWN; break;
         case 'd': case 'D': type = CommandType::WALK_RIGHT; break;
         case 'a': case 'A': type = CommandType::WALK_LEFT; break;
-        case '+': type = CommandType::WALK_DELTA_UP; break;
-        case '-': type = CommandType::WALK_DELTA_DOWN; break;
+        case '+': type = CommandType::WALK_LIFT_UP; break;
+        case '-': type = CommandType::WALK_LIFT_DOWN; break;
+        case ',': type = CommandType::WALK_DELTA_DOWN; break;
+        case '.': type = CommandType::WALK_DELTA_UP; break;
         case '[': type = CommandType::WALK_PERIOD_DOWN; break;
         case ']': type = CommandType::WALK_PERIOD_UP; break;
+        case ';': type = CommandType::WALK_TRIGGER_DOWN; break;
+        case '\'': type = CommandType::WALK_TRIGGER_UP; break;
         case 'c': case 'C': type = CommandType::WALK_TOGGLE_PITCH_COMP; break;
-        case 'x': case 'X': type = CommandType::WALK_TOGGLE_CENTER_COMP; break;
-        case '0': type = CommandType::WALK_ZERO_X; break;
+        case '0': type = CommandType::WALK_ZERO; break;
         case 'r': case 'R': type = CommandType::WALK_RESET_ATTITUDE; break;
         case 'v': case 'V': type = CommandType::WALK_VERIFY; break;
         case 'q': case 'Q': type = CommandType::WALK_QUIT; break;

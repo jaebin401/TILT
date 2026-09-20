@@ -43,7 +43,7 @@ constexpr float kMaxJogStepDeg = 5.0f;
 constexpr std::uint16_t kServoSpeedRaw = 0;
 constexpr std::uint8_t kServoAcceleration = 0;
 
-// IMU compensation shared by stand and rocking modes.
+// IMU compensation shared by stand, rocking, and walk modes.
 constexpr float kCompKpPitchDefault = 2.0f;
 constexpr float kCompKpPitchMax = 10.0f;
 constexpr float kCompKpPitchStep = 0.5f;
@@ -68,15 +68,30 @@ constexpr float kStepTestSettleDeg = 1.0f;
 
 constexpr std::uint32_t kStatusPrintPeriodMs = 200;
 
-// Forward walk experiment.
-constexpr float kWalkLegxDefaultMm = 5.0f;
+// Walk: open-loop rocking.
+constexpr float kWalkDeltaDefaultMm = 14.0f;
+constexpr float kWalkDeltaStepMm = 1.0f;
+constexpr std::uint32_t kWalkRockPeriodMs = 300;
+constexpr std::uint32_t kWalkRockPeriodMinMs = 150;
+constexpr std::uint32_t kWalkRockPeriodMaxMs = 800;
+constexpr std::uint32_t kWalkRockPeriodStepMs = 25;
+
+// Walk: explicit swing-foot lift.
+constexpr float kWalkLiftDefaultMm = 0.0f;
+constexpr float kWalkLiftMaxMm = 14.0f;
+constexpr float kWalkLiftStepMm = 1.0f;
+
+// Walk: roll-triggered swing with hysteresis and time bounds.
+constexpr float kWalkRollTriggerDeg = 2.5f;
+constexpr float kWalkRollReleaseDeg = 1.2f;
+constexpr float kWalkRollTriggerStepDeg = 0.25f;
+constexpr std::uint32_t kWalkSwingMinMs = 80;
+constexpr std::uint32_t kWalkSwingMaxMs = 400;
+
+// Walk: fore/aft foot motion.
+constexpr float kWalkLegxDefaultMm = 0.0f;
 constexpr float kWalkLegxMaxMm = 20.0f;
 constexpr float kWalkLegxStepMm = 1.0f;
-constexpr float kWalkDeltaDefaultMm = 14.0f;
-constexpr std::uint32_t kWalkLegTimeDefaultMs = 150;
-constexpr std::uint32_t kWalkLegTimeMinMs = 60;
-constexpr std::uint32_t kWalkLegTimeMaxMs = 500;
-constexpr std::uint32_t kWalkLegTimeStepMs = 10;
 constexpr std::uint32_t kWalkMaxConsecutiveRejects = 3;
 
 struct PosePreset {

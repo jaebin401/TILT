@@ -63,7 +63,7 @@ and verify height changes first.
 | `ik` | Enter the torso-motion IK demonstration after interpolating home. |
 | `stand` | Enter the floor-based stationary pitch-compensation test. |
 | `rock` | Enter the floor-based left/right weight-shift test after confirmation. |
-| `walk` | Enter the confirmed, floor-based four-state shuffle/walk test. |
+| `walk` | Enter the confirmed, IMU roll-triggered lift-and-step walk test. |
 
 In IK mode: arrow keys or `W/A/S/D` move the torso, `m` toggles fine/coarse
 steps, `0` returns to IK home, `v` compares encoder FK with the requested feet,
@@ -127,28 +127,34 @@ curved foot may not have returned to its original contact point.
 ## Walk test
 
 `walk` returns home after a safety confirmation, then waits stopped with
-`delta=14 mm` and `legx=0`. Press space to start only after confirming that
-stationary rocking is safe. Each leg follows the four IK-only phases short,
-forward, long, and backward; the right leg starts two phases ahead of the left.
-Unreachable or joint-limit-clamped targets are skipped, and three consecutive
-rejections stop the walk and return home.
+`delta=14 mm`, `lift=0`, and `legx=0`. Entry is rejected unless valid MPU6050
+roll/pitch data is available. Press space to start only after confirming that
+stationary rocking is safe. The delta sign flips on a fixed open-loop period,
+while relative roll selects the unloaded swing leg using separate entry and
+release thresholds. The swing foot receives the additional lift and forward x;
+the support foot moves backward. Every target uses IK only.
 
-- Space starts/stops; stopping returns `delta` and `legx` to zero.
+- Space starts/stops; stopping returns `delta`, `lift`, and `legx` to zero.
 - Left/right arrows or `A/D` change `legx` by 1 mm within ±20 mm.
 - Up/down arrows or `W/S` change base height by 0.5 mm.
-- `+` / `-` change `delta` by 1 mm within 0–24 mm.
-- `[` / `]` change the per-state time by 10 ms within 60–500 ms.
-- `c` toggles common pitch/body-x compensation; `x` toggles cycle-boundary
-  roll-centering compensation; `r` resets the roll/pitch reference.
-- `0` returns `legx` to zero; `v` prints state; `q` prints the result and
-  returns home; `!` E-STOPS.
+- `+` / `-` change swing-foot `lift` by 1 mm within 0–14 mm.
+- `,` / `.` change rocking `delta` by 1 mm within 0–24 mm.
+- `[` / `]` change the rocking period by 25 ms within 150–800 ms.
+- `;` / `'` change the roll entry threshold by 0.25°; release remains 1.2°.
+- `c` toggles common pitch/body-x compensation; `r` resets roll/pitch zero.
+- `0` returns both `lift` and `legx` to zero; `v` prints all parameters;
+  `q` prints the result and returns home; `!` E-STOPS.
 
-Walk output is limited to one line per complete four-state cycle. It reports
-cycle count and attitude, but intentionally does not estimate forward distance
-from the 6-axis IMU. The exit summary includes rejected steps and prints the
-curved-foot widening note only when measured roll amplitude is below 9.5°.
+Swing entry occurs at ±2.5° and is held until roll returns inside ±1.2°. The
+80 ms minimum prevents noise from cutting a swing short, while the 400 ms
+maximum forces release if roll does not return. Output is limited to swing-leg
+changes, including return to double support. The exit summary reports per-leg
+swing counts and average duration, forced releases, suppressed early releases,
+and rejected targets. It intentionally does not estimate forward distance from
+the 6-axis IMU.
 
 All compensation is disabled if relative roll or pitch exceeds 20°, or after
-five consecutive IMU read failures. The mode remains usable without IMU, but
-compensation cannot be enabled. Compensation targets that exceed the rocking
-workspace or logical joint limits are rejected instead of clamped and sent.
+five consecutive IMU read failures. Walk stops after five consecutive IMU
+failures because swing timing is no longer available. Targets that exceed the
+workspace or logical joint limits are rejected instead of clamped and sent;
+three consecutive rejections stop the walk.
