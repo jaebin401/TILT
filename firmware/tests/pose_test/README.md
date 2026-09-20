@@ -61,8 +61,31 @@ and verify height changes first.
 | `joint <name> <deg>` | Relative single-joint jog (maximum ±5°). |
 | `fk` | Calculate both feet from current encoder readings. |
 | `ik` | Enter the torso-motion IK demonstration after interpolating home. |
+| `rock` | Enter the floor-based left/right weight-shift test after confirmation. |
 
 In IK mode: arrow keys or `W/A/S/D` move the torso, `m` toggles fine/coarse
 steps, `0` returns to IK home, `v` compares encoder FK with the requested feet,
 `q` exits back to home, and `!` E-STOPS. Unreachable or joint-limit-clamped IK
 targets are rejected rather than sent to the servos.
+
+## Rocking test
+
+Unlike the earlier calibration steps, `rock` is meaningful only with both feet
+on the floor. Keep both hands ready to catch the robot before confirming the
+entry prompt. The test changes the two leg lengths in opposite directions while
+keeping `body_x=0`; MPU roll is display/abort information only and is never fed
+back into motion control. If the MPU6050 is unavailable, the mode remains usable
+and displays `roll=--`.
+
+- Arrow keys or `W/A/S/D`: change differential leg length or base height.
+- `m`: toggle 0.5 mm / 2 mm steps; `0`: return differential length to zero.
+- `1`: sweep from 0 to 14 mm with a 1.5 s hold at each 1 mm step.
+- `2`: alternate the current non-zero magnitude left/right; `[` and `]` adjust
+  its 300–2000 ms period in 100 ms steps.
+- `k`: record the visually observed left/right foot-lift point.
+- `v`: print current delta, leg lengths, and IMU roll; `q`: print the result and
+  return home; `!`: immediate E-STOP.
+
+Any key stops an automatic sequence and returns `delta` to zero. A target is
+rejected without transmission if IK is unreachable or any logical joint limit
+would be clamped. Automatic motion also stops if measured roll exceeds 20°.

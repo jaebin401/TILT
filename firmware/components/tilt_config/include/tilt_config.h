@@ -54,10 +54,15 @@ inline constexpr float RAD_PER_TICK = 6.28318530718f / SERVO_TICKS_PER_REV;
 
 // TODO: Measure and replace all six calibration values with tools/servo_tool.
 inline constexpr std::uint16_t ZERO_TICK[NUM_JOINTS] = {
-    2048, 2048, 2048, 2048, 2048, 2048,
+    2117,  // L_HIP_YAW
+    2027,  // L_HIP_PITCH
+    2073,  // L_KNEE_PITCH
+    2024,  // R_HIP_YAW
+    2075,  // R_HIP_PITCH
+    2020,  // R_KNEE_PITCH
 };
 inline constexpr std::int8_t JOINT_SIGN[NUM_JOINTS] = {
-    +1, +1, +1, +1, -1, -1,
+    +1, +1, +1, +1, +1, +1,
 };
 
 // ADR-008 zero pose.
@@ -83,14 +88,14 @@ struct JointLimit {
 // software limits and remain separate from the raw-servo calibration table.
 inline constexpr JointLimit JOINT_LIMIT[2][3] = {
     {
-        {-10.0f * DEG2RAD, +10.0f * DEG2RAD},
-        {-35.0f * DEG2RAD, +5.0f * DEG2RAD},
-        {-5.0f * DEG2RAD, +40.0f * DEG2RAD},
+        {   -85.0f * DEG2RAD,   +95.0f * DEG2RAD },  // L_HIP_YAW
+        {   -75.0f * DEG2RAD,   +76.10f * DEG2RAD },  // L_HIP_PITCH
+        {   -85.0f * DEG2RAD,  +108.0f * DEG2RAD },  // L_KNEE_PITCH
     },
     {
-        {-10.0f * DEG2RAD, +10.0f * DEG2RAD},
-        {-35.0f * DEG2RAD, +5.0f * DEG2RAD},
-        {-5.0f * DEG2RAD, +40.0f * DEG2RAD},
+        {   -85.0f * DEG2RAD,   +95.0f * DEG2RAD },  // R_HIP_YAW
+        {   -75.0f * DEG2RAD,   +76.10f * DEG2RAD },  // R_HIP_PITCH
+        {   -85.0f * DEG2RAD,  +108.0f * DEG2RAD },  // R_KNEE_PITCH
     },
 };
 

@@ -14,6 +14,22 @@ constexpr float kIkFineStepMm = 0.5f;
 constexpr float kIkCoarseStepMm = 2.0f;
 constexpr std::uint32_t kIkStepDurationMs = 150;
 
+// Rocking test: differential leg length while body_x remains zero.
+constexpr float kRockDeltaMaxMm = 16.0f;
+constexpr float kRockFineStepMm = 0.5f;
+constexpr float kRockCoarseStepMm = 2.0f;
+constexpr std::uint32_t kRockStepDurationMs = 300;
+constexpr float kRockSweepStartMm = 0.0f;
+constexpr float kRockSweepEndMm = 14.0f;
+constexpr float kRockSweepStepMm = 1.0f;
+constexpr std::uint32_t kRockSweepHoldMs = 1500;
+constexpr std::uint32_t kRockAlternatePeriodMs = 1000;
+constexpr std::uint32_t kRockAlternatePeriodMinMs = 300;
+constexpr std::uint32_t kRockAlternatePeriodMaxMs = 2000;
+constexpr std::uint32_t kRockAlternatePeriodStepMs = 100;
+constexpr float kRockRollAbortDeg = 20.0f;
+constexpr float kRockRecommendedMarginMm = 1.5f;
+
 constexpr std::uint32_t kPoseDurationMs = 3000;
 constexpr std::uint32_t kJointDurationMs = 1000;
 
