@@ -8,21 +8,16 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "tilt/config/HardwareConfig.h"
+#include "tilt/config/MotionConfig.h"
+#include "tilt/config/RobotConfig.h"
 #include "tilt/sts3215/Sts3215Bus.h"
 
 namespace {
 
 constexpr char kTag[] = "tilt_main";
 
-constexpr std::array<std::uint8_t, 6> kServoIds = {
-    11, 12, 13, 21, 22, 23,
-};
-
-constexpr std::uint16_t kFallbackPosition = 2048;
-constexpr std::int32_t kFineStep = 1;
-constexpr std::int32_t kCoarseStep = 20;
-constexpr std::uint16_t kFineSpeed = 0;
-constexpr std::uint16_t kCoarseSpeed = 0;
+constexpr const auto& kServoIds = tilt::config::robot::kServoIds;
 
 constexpr std::array<std::uint32_t, 10> kBaudCandidates = {
     1'000'000, 500'000, 250'000, 128'000, 115'200,
@@ -46,11 +41,14 @@ constexpr std::array<KeyMap, 12> kKeyMap = {{
 
 tilt::sts3215::BusConfig makeBusConfig() {
     tilt::sts3215::BusConfig config;
-    config.uart_port = UART_NUM_1;
-    config.tx_pin = GPIO_NUM_17;
-    config.rx_pin = GPIO_NUM_18;
-    config.baud_rate = tilt::sts3215::kDefaultBaudRate;
-    config.response_timeout_ms = 30;
+    config.uart_port = tilt::config::hardware::kServoUartPort;
+    config.tx_pin = tilt::config::hardware::kServoUartTxPin;
+    config.rx_pin = tilt::config::hardware::kServoUartRxPin;
+    config.baud_rate = tilt::config::hardware::kServoUartBaudRate;
+    config.response_timeout_ms =
+        tilt::config::hardware::kServoResponseTimeoutMs;
+    config.rx_buffer_size = tilt::config::hardware::kServoRxBufferSize;
+    config.tx_buffer_size = tilt::config::hardware::kServoTxBufferSize;
     return config;
 }
 
@@ -60,11 +58,13 @@ bool s_coarse_mode = false;
 bool s_armed = false;
 
 std::int32_t currentStep() {
-    return s_coarse_mode ? kCoarseStep : kFineStep;
+    return s_coarse_mode ? tilt::config::motion::kCoarseStepTicks
+                         : tilt::config::motion::kFineStepTicks;
 }
 
 std::uint16_t currentSpeed() {
-    return s_coarse_mode ? kCoarseSpeed : kFineSpeed;
+    return s_coarse_mode ? tilt::config::motion::kCoarseServoSpeedRaw
+                         : tilt::config::motion::kFineServoSpeedRaw;
 }
 
 const char* currentModeName() {
@@ -80,12 +80,15 @@ esp_err_t initializeConsoleInput() {
 
 void printHelp() {
     std::printf("\nTILT STS3215 incremental control\n");
-    std::printf("  q/a : servo 11 +/-\n");
-    std::printf("  w/s : servo 12 +/-\n");
-    std::printf("  e/d : servo 13 +/-\n");
-    std::printf("  r/f : servo 21 +/-\n");
-    std::printf("  t/g : servo 22 +/-\n");
-    std::printf("  y/h : servo 23 +/-\n");
+    for (std::size_t index = 0; index < kServoIds.size(); ++index) {
+        const auto joint_name = tilt::config::robot::kJointNames[index];
+        std::printf("  %c/%c : %.*s (servo %u) +/-\n",
+                    kKeyMap[index * 2].key,
+                    kKeyMap[index * 2 + 1].key,
+                    static_cast<int>(joint_name.size()),
+                    joint_name.data(),
+                    kServoIds[index]);
+    }
     std::printf("  m   : FINE/COARSE mode\n");
     std::printf("  p   : scan servo IDs 0..253\n");
     std::printf("  b   : scan common baud rates using configured IDs\n");
@@ -101,7 +104,8 @@ void printHelp() {
 
 void refreshCurrentPositions() {
     for (std::size_t index = 0; index < kServoIds.size(); ++index) {
-        std::uint16_t position = kFallbackPosition;
+        std::uint16_t position =
+            tilt::config::robot::kPositionReadFallbackTicks;
         const esp_err_t result = s_bus.readPosition(kServoIds[index], position);
         if (result == ESP_OK) {
             ESP_LOGI(kTag,
@@ -114,7 +118,7 @@ void refreshCurrentPositions() {
                      "servo %u position read failed (%s); using %u locally",
                      kServoIds[index],
                      esp_err_to_name(result),
-                     kFallbackPosition);
+                     tilt::config::robot::kPositionReadFallbackTicks);
         }
         s_current_position[index] = position;
         vTaskDelay(pdMS_TO_TICKS(10));
