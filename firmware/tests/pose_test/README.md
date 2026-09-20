@@ -61,12 +61,29 @@ and verify height changes first.
 | `joint <name> <deg>` | Relative single-joint jog (maximum ±5°). |
 | `fk` | Calculate both feet from current encoder readings. |
 | `ik` | Enter the torso-motion IK demonstration after interpolating home. |
+| `stand` | Enter the floor-based stationary pitch-compensation test. |
 | `rock` | Enter the floor-based left/right weight-shift test after confirmation. |
+| `walk` | Enter the confirmed, floor-based four-state shuffle/walk test. |
 
 In IK mode: arrow keys or `W/A/S/D` move the torso, `m` toggles fine/coarse
 steps, `0` returns to IK home, `v` compares encoder FK with the requested feet,
 `q` exits back to home, and `!` E-STOPS. Unreachable or joint-limit-clamped IK
 targets are rejected rather than sent to the servos.
+
+## Stand compensation test
+
+`stand` returns to home and starts with compensation **OFF**. Use it only on
+the floor with both hands ready to catch the robot. The control loop calculates
+pitch compensation every 30 ms while console status is limited to one line per
+200 ms.
+
+- `c`: toggle pitch compensation; `+` / `-`: adjust Kp by 0.5 mm/degree.
+- `[` / `]`: adjust the low-pass coefficient by 0.05.
+- Up/down arrows: change base height; `r`: reset roll and pitch zero.
+- `0`: disable compensation and return `body_x` to zero.
+- `t`: apply a +8 mm, 500 ms disturbance and record the following 2-second
+  response, including peak pitch, settling time, residual, and sign reversals.
+- `v`: print the current state; `q`: return to home; `!`: E-STOP.
 
 ## Rocking test
 
@@ -75,17 +92,63 @@ on the floor. Keep both hands ready to catch the robot before confirming the
 entry prompt. The test changes the two leg lengths in opposite directions while
 keeping `body_x=0`; MPU roll is display/abort information only and is never fed
 back into motion control. If the MPU6050 is unavailable, the mode remains usable
-and displays `roll=--`.
+and displays `roll=--`, `pitch=--`.
 
 - Arrow keys or `W/A/S/D`: change differential leg length or base height.
 - `m`: toggle 0.5 mm / 2 mm steps; `0`: return differential length to zero.
+- `f`: toggle the leg target generator. `FLAT` (the default) directly uses
+  `[0, -a, +a]` to keep each foot horizontal; `IK` preserves the original
+  free-foot-angle behavior and displays each target foot tilt.
 - `1`: sweep from 0 to 14 mm with a 1.5 s hold at each 1 mm step.
 - `2`: alternate the current non-zero magnitude left/right; `[` and `]` adjust
-  its 300–2000 ms period in 100 ms steps.
+  its 150–2000 ms period in 50 ms steps. If the requested period is shorter
+  than the velocity-limited move time, the period is expanded automatically.
 - `k`: record the visually observed left/right foot-lift point.
-- `v`: print current delta, leg lengths, and IMU roll; `q`: print the result and
-  return home; `!`: immediate E-STOP.
+- `r`: use the current IMU roll and pitch as the new zero; `v`: print current
+  delta, leg lengths, target foot geometry, and absolute/relative attitude.
+- `c`: toggle pitch/body-x compensation; `+` / `-`: adjust its Kp.
+- `x`: toggle cycle-boundary roll recentering; `z`: toggle cycle-boundary roll
+  amplitude tracking. Both roll compensators default to OFF.
+- `q`: print the result and return home; `!`: immediate E-STOP.
 
 Any key stops an automatic sequence and returns `delta` to zero. A target is
 rejected without transmission if IK is unreachable or any logical joint limit
 would be clamped. Automatic motion also stops if measured roll exceeds 20°.
+Move duration is automatically extended from the largest joint-angle change so
+the 180°/s speed guard remains a final fault barrier rather than a normal motion
+limiter. Stopping alternating rocking prints roll/pitch peak-to-peak motion and
+the final pitch residual, compensation state, roll-center movement, final
+delta bias/scale, and body-x usage. It warns for dominant pitch oscillation,
+possible backward drift, or saturated body-x authority. Roll bias and amplitude
+scale update only at commanded-delta sign changes, never every control tick.
+After returning to `delta=0`, a relative-roll residual over 1° warns that the
+curved foot may not have returned to its original contact point.
+
+## Walk test
+
+`walk` returns home after a safety confirmation, then waits stopped with
+`delta=14 mm` and `legx=0`. Press space to start only after confirming that
+stationary rocking is safe. Each leg follows the four IK-only phases short,
+forward, long, and backward; the right leg starts two phases ahead of the left.
+Unreachable or joint-limit-clamped targets are skipped, and three consecutive
+rejections stop the walk and return home.
+
+- Space starts/stops; stopping returns `delta` and `legx` to zero.
+- Left/right arrows or `A/D` change `legx` by 1 mm within ±20 mm.
+- Up/down arrows or `W/S` change base height by 0.5 mm.
+- `+` / `-` change `delta` by 1 mm within 0–24 mm.
+- `[` / `]` change the per-state time by 10 ms within 60–500 ms.
+- `c` toggles common pitch/body-x compensation; `x` toggles cycle-boundary
+  roll-centering compensation; `r` resets the roll/pitch reference.
+- `0` returns `legx` to zero; `v` prints state; `q` prints the result and
+  returns home; `!` E-STOPS.
+
+Walk output is limited to one line per complete four-state cycle. It reports
+cycle count and attitude, but intentionally does not estimate forward distance
+from the 6-axis IMU. The exit summary includes rejected steps and prints the
+curved-foot widening note only when measured roll amplitude is below 9.5°.
+
+All compensation is disabled if relative roll or pitch exceeds 20°, or after
+five consecutive IMU read failures. The mode remains usable without IMU, but
+compensation cannot be enabled. Compensation targets that exceed the rocking
+workspace or logical joint limits are rejected instead of clamped and sent.
