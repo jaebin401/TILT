@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace tilt {
 
 inline constexpr float DEG2RAD = 0.01745329251994329577f;
@@ -16,6 +18,13 @@ inline constexpr float ANKLE_FIXED_RAD = -20.0f * DEG2RAD;
 inline constexpr float KNEE_OFFSET_RAD = +20.0f * DEG2RAD;
 
 inline constexpr float YAW_SINGULARITY_EPS_MM = 1.0f;
+
+inline constexpr int IMU_I2C_PORT = 0;
+inline constexpr int IMU_SDA_PIN = 8;
+inline constexpr int IMU_SCL_PIN = 9;
+inline constexpr std::uint8_t IMU_I2C_ADDR = 0x68;
+inline constexpr float IMU_FILTER_ALPHA = 0.98f;
+inline constexpr std::uint32_t IMU_SAMPLE_PERIOD_MS = 10;
 
 struct JointLimit {
     float minimum_rad;

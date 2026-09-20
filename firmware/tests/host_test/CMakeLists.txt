@@ -12,3 +12,11 @@ add_executable(test_kinematics
 target_include_directories(test_kinematics PRIVATE
     ../../components/tilt_kinematics/include
     ../../components/tilt_config/include)
+
+add_executable(test_filter
+    test_filter.cpp
+    ../../components/tilt_MPU6050/complementary.cpp)
+
+target_include_directories(test_filter PRIVATE
+    ../../components/tilt_MPU6050/include
+    ../../components/tilt_config/include)
