@@ -64,7 +64,8 @@ lean을 반영한 발판의 수평 각도를 확인한다.
 | `stand [h] [lean_deg]` | 양발을 같은 높이의 평행 자세로 2초 이동 |
 | `rock` | 기준 stand 자세로 이동한 뒤 정지 상태의 rock 모드 진입 |
 
-rock 모드에서는 Enter 없이 한 키씩 입력한다.
+rock 모드에서는 Enter 없이 한 키씩 입력한다. 기본 패턴은 `PHASE6`이고,
+정지 상태에서 `m`으로 `BRUTON`과 전환한다. 전환 시 해당 키 안내가 출력된다.
 
 | 키 | 동작 |
 | --- | --- |
@@ -76,6 +77,9 @@ rock 모드에서는 Enter 없이 한 키씩 입력한다.
 | `1` / `2` | shift duration ∓/±10ms |
 | `3` / `4` | lift duration ∓/±10ms |
 | `5` / `6` | plant duration ∓/±10ms |
+| `[` / `]` | lift 정점 hold ∓/±10ms (0–1000ms) |
+| `;` / `'` | plant hold ∓/±10ms (0–1000ms) |
+| `m` | 정지 상태에서 PHASE6 ↔ BRUTON 전환 |
 | `,` / `.` | lean ∓/±0.5° |
 | `k` | 육안으로 확인한 발-뜸을 현재 phase·높이·roll과 함께 기록 |
 | `r` | 표시용 IMU roll/pitch 기준 재설정 |
@@ -83,6 +87,16 @@ rock 모드에서는 Enter 없이 한 키씩 입력한다.
 | `0` | 정지 후 base 평행 stand로 복귀 |
 | `q` | 종료 요약 후 base 평행 stand로 복귀, 줄 단위 콘솔 복귀 |
 | `!` | 즉시 E-STOP |
+
+BRUTON 패턴에서는 `space`가 별도의 양다리 dual-timer 동작을 시작/정지한다.
+오른다리가 먼저 시작하고, 좌우 높이를 독립적으로 보간한다. `shift`는
+사용하지 않는다. `n`, 좌우 방향키/A·D, `5`/`6`, hold 키는 동작하지 않고
+안내만 출력한다. 위/아래는 base, `+`/`-`는 lift, `,`/`.`는 lean이며,
+`1`/`2`는 step time, `3`/`4`는 leg time을 각각 10ms씩 조정한다.
+`i`로 pitch 기반의 미세한 시간 변조를 켜거나 끌 수 있다(기본 OFF).
+IMU는 자동 정지나 스윙 판정에 사용하지 않는다. BRUTON 정지 시 양다리는
+2초 동안 base로 복귀한다. 다른 높이에서 시작하려 하면 먼저 `0`으로
+base에 복귀해야 한다.
 
 base는 85–104mm, shift는 0–10mm, lift는 0–15mm다. 개별 phase 목표가
 기구학 범위 또는 관절 한계 밖이면 `v`에 `UNREACHABLE`로 표시된다. 그런
@@ -92,7 +106,8 @@ base는 85–104mm, shift는 0–10mm, lift는 0–15mm다. 개별 phase 목표�
 ## 6개 phase
 
 기본값은 base=96.5mm, shift=3mm, lift=0mm,
-shift/lift/plant duration=150/140/140ms다. `rock` 진입만으로 연속 모드가
+shift/lift/plant duration=150/140/140ms, lift/plant hold=140/0ms다.
+hold를 둘 다 0으로 설정하면 기존 6-phase 타이밍과 같다. `rock` 진입만으로 연속 모드가
 시작되지는 않는다.
 
 | # | phase | 왼쪽 높이 | 오른쪽 높이 | duration |
@@ -110,12 +125,23 @@ shift/lift/plant duration=150/140/140ms다. `rock` 진입만으로 연속 모드
 연속 모드에서는 phase마다 출력하지 않고 여섯 phase가 끝날 때마다 한 줄의
 roll/pitch 범위와 지지발 최대 Δx를 출력한다.
 
+LIFT 정점 hold가 끝날 때마다 해당 다리의 knee 서보 하나를 읽어 명령한
+다리 접힘량 대비 실제 접힘량을 출력한다. BRUTON은 다리별 state 1→2에서
+동일하게 측정한다. `v`에는 최근 10회 추종률 평균·최소, 종료 요약에는
+전체 평균이 나온다. 이 값은 **다리가 접힌 정도**이지 발의 지면
+클리어런스나 실제 발-뜸 판정이 아니다. 읽기 실패 시 해당 측정만 건너뛴다.
+
+BRUTON 기본값은 lift=6.5mm, step time=250ms, leg time=140ms이다.
+각 다리는 접기 → 짧은 높이 유지 → 펴기 → 긴 높이 유지의 4-state를
+독립적으로 수행한다. x 이동이나 IK는 추가하지 않았다.
+
 평행 다리는 발바닥 각도를 유지하는 대신 높이에 따라 발 x가 바뀐다.
 `foot_x = L1 sin(a) − L2 sin(−ANKLE_FIXED)`이며 base 96.5mm 부근에서는
 높이 1mm당 약 1.29mm의 x 이동이 생긴다. `v`에 이 결합 비율을 표시한다.
 lean의 양수는 상체를 앞으로 숙이는 방향이며, 사용 중 IMU pitch가 반대로
-간다면 부호를 다시 확인해야 한다. IMU는 표시용이며 제어·자동 정지에
-사용하지 않는다.
+간다면 부호를 다시 확인해야 한다. PHASE6에서 IMU는 표시용이며,
+BRUTON에서만 `i`를 켰을 때 pitch가 타이밍을 미세조정한다. 어느 패턴에서도
+IMU로 자동 정지하거나 발-뜸을 판정하지 않는다.
 
 속도 가드는 400°/s의 최후 방어선이다. 발동 시 목표를 마지막으로 성공한
 전송값에 고정해 경고의 무한 반복을 막고 연속 모드를 정지한다. 서보 speed와
