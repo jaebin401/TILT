@@ -74,6 +74,9 @@ private:
     bool startup_warned_ = false;
     bool previous_roll_valid_ = false;
     float previous_roll_deg_ = 0.0f;
+    float roll_history_[3]{};
+    std::uint8_t roll_history_count_ = 0;
+    std::uint8_t roll_history_next_ = 0;
     float peak_toward_stance_deg_ = 0.0f;
     float period_min_roll_deg_ = 0.0f;
     float period_max_roll_deg_ = 0.0f;

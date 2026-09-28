@@ -23,11 +23,13 @@ public:
     bool available() const { return available_; }
     float rawRollDeg() const { return raw_roll_deg_; }
     RollState state() const { return state_; }
+    std::uint32_t rejectedSamples() const { return rejected_samples_; }
 
 private:
     tilt::ComplementaryFilter filter_;
     RollState state_{};
     std::uint32_t previous_ms_ = 0;
+    std::uint32_t rejected_samples_ = 0;
     float raw_roll_deg_ = 0.0f;
     float zero_roll_deg_ = 0.0f;
     float filtered_rate_deg_s_ = 0.0f;

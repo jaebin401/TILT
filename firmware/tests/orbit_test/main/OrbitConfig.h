@@ -13,10 +13,15 @@ constexpr float kTargetLambdaHalfT = 1.28f;
 constexpr float kGravityMmS2 = 9810.0f;
 
 // Change these after the suspended check if physical sides or IMU polarity differ.
-constexpr bool kSwapLegSides = false;
-constexpr std::int8_t kRollSign = +1;
+constexpr bool kSwapLegSides = true;
+constexpr std::int8_t kRollSign = -1;
+constexpr bool kMappingConfigured = kSwapLegSides || kRollSign != +1;
 
 constexpr std::uint32_t kLoopPeriodMs = 10;
+constexpr bool kLiftMeasureDefault = false;
+constexpr int kLiftMeasureMaxConsecutiveFailures = 5;
+constexpr float kMaxImuDtS = 0.05f;
+constexpr float kMaxPlausibleRateDegS = 400.0f;
 constexpr float kLiftZmaxDefaultMm = 6.5f;
 constexpr float kLiftZnegMm = -1.5f;
 constexpr float kLiftMaxMm = 14.0f;

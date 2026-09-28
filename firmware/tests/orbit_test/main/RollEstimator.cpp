@@ -11,6 +11,7 @@ bool RollEstimator::begin() {
     filter_.reset();
     state_ = {};
     previous_ms_ = 0;
+    rejected_samples_ = 0;
     rate_initialized_ = false;
     sign_ = kRollSign >= 0 ? +1 : -1;
     return available_;
@@ -30,21 +31,38 @@ RollState RollEstimator::sample(std::uint32_t now_ms) {
     }
     const float dt_s = previous_ms_ == 0
         ? kLoopPeriodMs / 1000.0f
-        : (now_ms - previous_ms_) / 1000.0f;
+        : static_cast<float>(now_ms - previous_ms_) / 1000.0f;
     previous_ms_ = now_ms;
-    const tilt::Attitude attitude = filter_.update(raw, dt_s);
+    // imu_read_raw() has already applied the configured axis mapping. The
+    // complementary filter integrates gx for roll, so reject an implausible
+    // gx before it can contaminate either the filter or the crossing trigger.
+    const float raw_rate = tilt::gyro_to_rad_s(raw.gx) / tilt::DEG2RAD;
+    const bool rate_spike = !std::isfinite(raw_rate) ||
+        std::fabs(raw_rate) > kMaxPlausibleRateDegS;
+    if (rate_spike) {
+        ++rejected_samples_;
+        return state_;
+    }
+    const bool abnormal_dt = !std::isfinite(dt_s) || dt_s <= 0.0f ||
+                             dt_s > kMaxImuDtS;
+    if (abnormal_dt) {
+        // Reset makes the next update initialize directly from accelerometer
+        // attitude, without integrating gyro across a stalled loop.
+        filter_.reset();
+        ++rejected_samples_;
+    }
+    const tilt::Attitude attitude = filter_.update(
+        raw, abnormal_dt ? kLoopPeriodMs / 1000.0f : dt_s);
     if (!filter_.initialized()) {
         state_.valid = false;
         return state_;
     }
-    // imu_read_raw() has already applied the configured axis mapping. The
-    // complementary filter integrates gx for roll, so use exactly that gyro.
-    const float raw_rate = tilt::gyro_to_rad_s(raw.gx) /
-                           tilt::DEG2RAD;
-    filtered_rate_deg_s_ = rate_initialized_
-        ? 0.5f * raw_rate + 0.5f * filtered_rate_deg_s_
-        : raw_rate;
-    rate_initialized_ = true;
+    if (!abnormal_dt) {
+        filtered_rate_deg_s_ = rate_initialized_
+            ? 0.5f * raw_rate + 0.5f * filtered_rate_deg_s_
+            : raw_rate;
+        rate_initialized_ = true;
+    }
     raw_roll_deg_ = attitude.roll_rad / tilt::DEG2RAD;
     state_.roll_deg = (raw_roll_deg_ - zero_roll_deg_) * sign_;
     state_.rate_deg_s = filtered_rate_deg_s_ * sign_;
