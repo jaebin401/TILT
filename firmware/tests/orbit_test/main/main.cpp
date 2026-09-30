@@ -37,7 +37,8 @@ enum class Cmd : std::uint8_t {
     HELP, STATUS, MODEL, ARM, DISARM, RECOVER, CHECK, CHECK_LEFT,
     CHECK_RIGHT, CHECK_TILT_START, STAND, GAIT_ENTER, MODE_ROCK, MODE_OPEN, MODE_ORBIT,
     TOGGLE, PERIOD_DOWN, PERIOD_UP, LIFT_DOWN, LIFT_UP, PUSH_DOWN,
-    PUSH_UP, ENERGY, SHIFT_DOWN, SHIFT_UP, ZERO_ROLL, CSV, VIEW, QUIT,
+    PUSH_UP, ENERGY, SHIFT_DOWN, SHIFT_UP, ZERO_ROLL, CSV,
+    LIFT_MEASURE, VIEW, QUIT,
 };
 enum class RampKind : std::uint8_t {
     NONE, STAND, CHECK_UP, CHECK_RETURN, GAIT_STOP, GAIT_EXIT,
@@ -75,8 +76,25 @@ struct RunningStats {
     float clearance_sum = 0.0f;
     float clearance_min = 0.0f;
     std::uint32_t clearance_count = 0;
+    float max_abs_x_drift_mm = 0.0f;
     std::uint32_t rejected_targets = 0;
     std::uint32_t speed_guards = 0;
+    std::uint32_t loop_delays = 0;
+    std::uint32_t max_loop_delay_ms = 0;
+};
+
+struct MeasureRequest {
+    std::uint32_t sequence = 0;
+    int logical_leg = -1;
+    int knee_joint = -1;
+    float command_lift_mm = 0.0f;
+};
+
+struct MeasureResult {
+    std::uint32_t sequence = 0;
+    float command_lift_mm = NAN;
+    float actual_lift_mm = NAN;
+    bool success = false;
 };
 
 constexpr tilt::sts3215::BusConfig kBusConfig{
@@ -90,20 +108,25 @@ tilt::sts3215::Sts3215Bus g_bus(kBusConfig);
 tilt_orbit::RollEstimator g_estimator;
 tilt_orbit::GaitController g_gait;
 QueueHandle_t g_queue = nullptr;
+QueueHandle_t g_measure_request_queue = nullptr;
+QueueHandle_t g_measure_result_queue = nullptr;
 SemaphoreHandle_t g_motion_mutex = nullptr;
 std::atomic<Safety> g_safety{Safety::DISARMED};
 std::atomic<bool> g_gait_console{false};
 std::atomic<bool> g_check_answer_pending{false};
 
 bool g_swap_sides = tilt_orbit::kSwapLegSides;
-bool g_check_passed = false;
+bool g_check_passed = tilt_orbit::kMappingConfigured;
 bool g_pose_known = false;
 bool g_goal_valid = false;
 bool g_speed_warned = false;
 bool g_target_warned = false;
 bool g_imu_warned = false;
-bool g_knee_warned = false;
 bool g_csv = false;
+std::atomic<bool> g_lift_measure_enabled{tilt_orbit::kLiftMeasureDefault};
+int g_measure_consecutive_failures = 0;
+std::uint32_t g_measure_sequence = 0;
+std::atomic<std::uint32_t> g_measure_pending_sequence{0};
 float g_goal_rad[tilt::NUM_JOINTS]{};
 float g_sent_height_mm[2]{tilt::ZERO_POSE_HEIGHT_MM,
                            tilt::ZERO_POSE_HEIGHT_MM};
@@ -120,16 +143,45 @@ float g_last_lift_actual_mm = NAN;
 float g_last_lift_command_mm = NAN;
 float g_last_lift_ratio = NAN;
 std::uint32_t g_rock_cycles = 0;
+std::uint32_t g_last_loop_tick_ms = 0;
+std::uint32_t g_last_goal_sent_ms = 0;
+std::uint32_t g_rejected_imu_at_start = 0;
+bool g_loop_delay_warned = false;
 
 std::uint32_t nowMs() {
     return static_cast<std::uint32_t>(
         xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
+void monitorLoopDelay(std::uint32_t now) {
+    if (g_last_loop_tick_ms != 0) {
+        const std::uint32_t dt_ms = now - g_last_loop_tick_ms;
+        if (dt_ms > 2 * tilt_orbit::kLoopPeriodMs) {
+            ++g_stats.loop_delays;
+            g_stats.max_loop_delay_ms =
+                std::max(g_stats.max_loop_delay_ms, dt_ms);
+            if (!g_loop_delay_warned) {
+                ESP_LOGW(kTag, "control loop delayed %lums (limit %lums); "
+                         "further warnings suppressed",
+                         static_cast<unsigned long>(dt_ms),
+                         static_cast<unsigned long>(
+                             2 * tilt_orbit::kLoopPeriodMs));
+                g_loop_delay_warned = true;
+            }
+        }
+    }
+    g_last_loop_tick_ms = now;
+}
+
+std::uint32_t rejectedImuSinceStart() {
+    return g_estimator.rejectedSamples() - g_rejected_imu_at_start;
+}
+
 class MotionGuard {
 public:
-    MotionGuard() : locked_(g_motion_mutex != nullptr &&
-        xSemaphoreTake(g_motion_mutex, portMAX_DELAY) == pdTRUE) {}
+    explicit MotionGuard(TickType_t wait_ticks = portMAX_DELAY)
+        : locked_(g_motion_mutex != nullptr &&
+          xSemaphoreTake(g_motion_mutex, wait_ticks) == pdTRUE) {}
     ~MotionGuard() {
         if (locked_) xSemaphoreGive(g_motion_mutex);
     }
@@ -229,34 +281,46 @@ bool sendPhysical(float height0, float height1, float lean) {
         g_ramp.active = false;
         return false;
     }
-    for (int joint = 0; joint < tilt::NUM_JOINTS; ++joint) {
-        if (g_goal_valid && std::fabs(target[joint] - g_goal_rad[joint]) >
-            tilt_orbit::kMaxJointVelocityDegS *
-            tilt_orbit::kLoopPeriodMs / 1000.0f * tilt::DEG2RAD) {
-            if (!g_speed_warned) {
-                ESP_LOGW(kTag, "speed guard blocked %s (%+.2f deg/tick)",
-                         tilt::JOINT_NAME[joint],
-                         (target[joint] - g_goal_rad[joint]) /
-                             tilt::DEG2RAD);
-                ++g_stats.speed_guards;
-            }
-            g_speed_warned = true;
-            g_gait.stop();
-            g_ramp.active = false;
-            std::printf("Motion stopped; last successfully transmitted goal held.\n");
-            return false;
-        }
-    }
     esp_err_t result = ESP_FAIL;
     {
-        MotionGuard guard;
-        if (!guard || g_safety.load() != Safety::ARMED) return false;
+        MotionGuard guard(0);
+        if (!guard) {
+            // A low-priority measurement may own the UART briefly. Never
+            // block the 100 Hz gait loop; hold the last transmitted goal.
+            return g_gait.running();
+        }
+        if (g_safety.load() != Safety::ARMED) return false;
+        const std::uint32_t elapsed_since_send_ms = g_last_goal_sent_ms == 0
+            ? tilt_orbit::kLoopPeriodMs
+            : std::clamp(nowMs() - g_last_goal_sent_ms,
+                         tilt_orbit::kLoopPeriodMs,
+                         static_cast<std::uint32_t>(100));
+        const float max_step_rad = tilt_orbit::kMaxJointVelocityDegS *
+            elapsed_since_send_ms / 1000.0f * tilt::DEG2RAD;
+        for (int joint = 0; joint < tilt::NUM_JOINTS; ++joint) {
+            if (g_goal_valid && std::fabs(target[joint] - g_goal_rad[joint]) >
+                max_step_rad) {
+                if (!g_speed_warned) {
+                    ESP_LOGW(kTag, "speed guard blocked %s (%+.2f deg/tick)",
+                             tilt::JOINT_NAME[joint],
+                             (target[joint] - g_goal_rad[joint]) /
+                                 tilt::DEG2RAD);
+                    ++g_stats.speed_guards;
+                }
+                g_speed_warned = true;
+                g_gait.stop();
+                g_ramp.active = false;
+                std::printf("Motion stopped; last successfully transmitted goal held.\n");
+                return false;
+            }
+        }
         result = g_bus.syncWritePositions(
             tilt::SERVO_ID, ticks, tilt::NUM_JOINTS,
             tilt_orbit::kServoSpeedRaw);
         if (result == ESP_OK) {
             std::memcpy(g_goal_rad, target, sizeof(target));
             g_goal_valid = true;
+            g_last_goal_sent_ms = nowMs();
             g_sent_height_mm[0] = height0;
             g_sent_height_mm[1] = height1;
             g_sent_lean_rad = lean;
@@ -350,6 +414,7 @@ void arm() {
             tilt_orbit::kServoSpeedRaw) != ESP_OK) {
         std::printf("arm rejected: hold goal write failed.\n"); return;
     }
+    g_last_goal_sent_ms = nowMs();
     for (int joint = 0; joint < tilt::NUM_JOINTS; ++joint) {
         if (g_bus.setAcceleration(tilt::SERVO_ID[joint],
             tilt_orbit::kServoAcceleration) != ESP_OK) {
@@ -473,13 +538,20 @@ void printView() {
                 roll.roll_deg, roll.rate_deg_s, roll.lateral_mm,
                 roll.valid ? "valid" : "invalid");
     std::printf("  switches=%lu watchdogs=%lu check=%s mapping=%s "
-                "rejected=%lu speed_guard=%lu\n",
+                "lift measure=%s (fail streak %d)\n",
                 static_cast<unsigned long>(g_gait.switches()),
                 static_cast<unsigned long>(g_gait.watchdogs()),
                 g_check_passed ? "passed" : "NOT passed",
                 g_swap_sides ? "swapped" : "normal",
+                g_lift_measure_enabled.load() ? "ON" : "OFF",
+                g_measure_consecutive_failures);
+    std::printf("  rejected=%lu speed_guard=%lu loop delays=%lu (max %lums) "
+                "rejected IMU=%lu\n",
                 static_cast<unsigned long>(g_stats.rejected_targets),
-                static_cast<unsigned long>(g_stats.speed_guards));
+                static_cast<unsigned long>(g_stats.speed_guards),
+                static_cast<unsigned long>(g_stats.loop_delays),
+                static_cast<unsigned long>(g_stats.max_loop_delay_ms),
+                static_cast<unsigned long>(rejectedImuSinceStart()));
 }
 
 void printSummary() {
@@ -512,10 +584,16 @@ void printSummary() {
                     g_stats.clearance_sum / g_stats.clearance_count,
                     g_stats.clearance_min);
     else std::printf("  estimated foot clearance --\n");
+    std::printf("  max x drift %.1fmm (support-foot fore-aft motion from push)\n",
+                g_stats.max_abs_x_drift_mm);
     std::printf("  final push delta %.1fmm, rejected targets %lu, "
-                "speed guard %lu\n\n", g_gait.pushMm(),
+                "speed guard %lu\n", g_gait.pushMm(),
                 static_cast<unsigned long>(g_stats.rejected_targets),
                 static_cast<unsigned long>(g_stats.speed_guards));
+    std::printf("  loop delays %lu (max %lums), rejected IMU samples %lu\n\n",
+                static_cast<unsigned long>(g_stats.loop_delays),
+                static_cast<unsigned long>(g_stats.max_loop_delay_ms),
+                static_cast<unsigned long>(rejectedImuSinceStart()));
 }
 
 void finishRamp(std::uint32_t now) {
@@ -581,7 +659,9 @@ void beginCheck() {
                 "Moving ID 11-13 block 5mm shorter.\n");
     if (beginRamp(target, g_sent_height_mm[1], g_sent_lean_rad,
                   tilt_orbit::kStandDurationMs, RampKind::CHECK_UP)) {
-        g_check_passed = false;
+        // A persisted non-default mapping remains trusted while a re-check is
+        // in progress. A successful check below still replaces runtime values.
+        g_check_passed = tilt_orbit::kMappingConfigured;
         g_check_stage = CheckStage::MOVING_UP;
     }
 }
@@ -615,11 +695,15 @@ void serviceCheck(std::uint32_t now) {
     g_check_stage = CheckStage::NONE;
     if (std::fabs(g_check_roll_largest_delta) < 1.0f) {
         std::printf("check incomplete: left tilt was not detected (less than 1deg). "
-                    "Repeat check; ORBIT remains locked.\n");
+                    "Repeat check; persisted config remains in effect.\n");
         return;
     }
-    g_swap_sides = !g_id11_is_left;
+    const bool checked_swap_sides = !g_id11_is_left;
     const int sign = g_check_roll_largest_delta >= 0.0f ? +1 : -1;
+    const bool differs_from_config =
+        checked_swap_sides != tilt_orbit::kSwapLegSides ||
+        sign != tilt_orbit::kRollSign;
+    g_swap_sides = checked_swap_sides;
     g_estimator.setSign(sign);
     g_check_passed = true;
     std::printf("check result:\n  ID 11-13 = robot %s leg -> "
@@ -629,6 +713,9 @@ void serviceCheck(std::uint32_t now) {
                 g_id11_is_left ? "LEFT" : "RIGHT",
                 g_swap_sides ? "true" : "false",
                 g_check_roll_largest_delta, sign);
+    if (differs_from_config)
+        std::printf("WARNING: check result differs from OrbitConfig.h. "
+                    "Update the header.\n");
 }
 
 void beginTiltMeasurement() {
@@ -680,41 +767,115 @@ void startOrStopGait() {
     g_stats = {};
     g_rock_cycles = 0;
     g_last_lift_actual_mm = g_last_lift_command_mm = g_last_lift_ratio = NAN;
-    g_imu_warned = g_knee_warned = false;
+    g_imu_warned = false;
+    g_measure_consecutive_failures = 0;
+    g_measure_pending_sequence = 0;
+    g_loop_delay_warned = false;
+    g_last_loop_tick_ms = nowMs();
+    g_rejected_imu_at_start = g_estimator.rejectedSamples();
     g_gait.start(nowMs());
     std::printf("%s STARTUP: building lateral orbit; no foot lifting yet.\n",
                 tilt_orbit::modeName(g_gait.mode()));
 }
 
-void measureSwing(int logical_leg, float command_height) {
+void toggleLiftMeasurement() {
+    const bool enabled = !g_lift_measure_enabled.load();
+    g_lift_measure_enabled.store(enabled);
+    g_measure_pending_sequence.store(0);
+    g_measure_consecutive_failures = 0;
+    g_last_lift_actual_mm = g_last_lift_command_mm = g_last_lift_ratio = NAN;
+    std::printf("Lift measurement %s%s\n", enabled ? "ON" : "OFF",
+                enabled ? " (single async read; auto-OFF after 5 failures)."
+                        : ".");
+}
+
+void recordMeasurementFailure() {
+    g_last_lift_actual_mm = g_last_lift_command_mm = g_last_lift_ratio = NAN;
+    ++g_measure_consecutive_failures;
+    if (g_measure_consecutive_failures <
+        tilt_orbit::kLiftMeasureMaxConsecutiveFailures) return;
+    g_lift_measure_enabled.store(false);
+    g_measure_pending_sequence = 0;
+    std::printf("WARNING: lift measurement failed %d consecutive times; "
+                "automatically disabled. Press k to retry.\n",
+                tilt_orbit::kLiftMeasureMaxConsecutiveFailures);
+}
+
+void requestSwingMeasurement(int logical_leg, float command_height) {
+    g_last_lift_actual_mm = g_last_lift_command_mm = g_last_lift_ratio = NAN;
+    if (!g_lift_measure_enabled.load()) return;
     const int physical = g_swap_sides ? 1 - logical_leg : logical_leg;
     const int knee_joint = physical * 3 + 2;
     const float command_lift = tilt_orbit::kNominalHeightMm - command_height;
     if (command_lift < 0.5f) return;
-    std::uint16_t raw = 0;
-    const esp_err_t result = g_bus.readPosition(
-        tilt::SERVO_ID[knee_joint], raw);
-    if (result != ESP_OK) {
-        if (!g_knee_warned)
-            ESP_LOGW(kTag, "swing knee read failed: %s; event skipped",
-                     esp_err_to_name(result));
-        g_knee_warned = true;
-        g_last_lift_actual_mm = g_last_lift_command_mm = g_last_lift_ratio = NAN;
-        return;
+    MeasureRequest request{};
+    request.sequence = ++g_measure_sequence;
+    request.logical_leg = logical_leg;
+    request.knee_joint = knee_joint;
+    request.command_lift_mm = command_lift;
+    g_measure_pending_sequence.store(request.sequence);
+    if (g_measure_request_queue == nullptr ||
+        xQueueSend(g_measure_request_queue, &request, 0) != pdTRUE) {
+        g_measure_pending_sequence.store(0);
+        recordMeasurementFailure();
     }
-    g_knee_warned = false;
-    const float actual_height = tilt_orbit::heightFromKnee(
-        tickToRad(knee_joint, raw));
-    const float actual_lift = tilt_orbit::kNominalHeightMm - actual_height;
-    const float ratio = actual_lift / command_lift;
-    if (!std::isfinite(ratio)) return;
-    g_last_lift_actual_mm = actual_lift;
-    g_last_lift_command_mm = command_lift;
-    g_last_lift_ratio = ratio;
-    g_stats.lift_ratio_sum += ratio;
-    g_stats.lift_ratio_min = g_stats.lift_count == 0
-        ? ratio : std::min(g_stats.lift_ratio_min, ratio);
-    ++g_stats.lift_count;
+}
+
+void serviceMeasurementResult() {
+    if (g_measure_result_queue == nullptr) return;
+    MeasureResult result{};
+    while (xQueueReceive(g_measure_result_queue, &result, 0) == pdTRUE) {
+        if (result.sequence != g_measure_pending_sequence.load()) continue;
+        g_measure_pending_sequence.store(0);
+        if (!g_lift_measure_enabled.load() || !result.success ||
+            !std::isfinite(result.actual_lift_mm) ||
+            !std::isfinite(result.command_lift_mm) ||
+            result.command_lift_mm < 0.5f) {
+            recordMeasurementFailure();
+            continue;
+        }
+        const float ratio = result.actual_lift_mm / result.command_lift_mm;
+        if (!std::isfinite(ratio)) {
+            recordMeasurementFailure();
+            continue;
+        }
+        g_measure_consecutive_failures = 0;
+        g_last_lift_actual_mm = result.actual_lift_mm;
+        g_last_lift_command_mm = result.command_lift_mm;
+        g_last_lift_ratio = ratio;
+        g_stats.lift_ratio_sum += ratio;
+        g_stats.lift_ratio_min = g_stats.lift_count == 0
+            ? ratio : std::min(g_stats.lift_ratio_min, ratio);
+        ++g_stats.lift_count;
+    }
+}
+
+void measurementTask(void*) {
+    MeasureRequest request{};
+    while (true) {
+        if (xQueueReceive(g_measure_request_queue, &request,
+                          portMAX_DELAY) != pdTRUE) continue;
+        MeasureResult result{};
+        result.sequence = request.sequence;
+        result.command_lift_mm = request.command_lift_mm;
+        if (g_lift_measure_enabled.load() &&
+            request.sequence == g_measure_pending_sequence.load() &&
+            g_safety.load() == Safety::ARMED) {
+            MotionGuard guard(0);
+            if (guard) {
+                std::uint16_t raw = 0;
+                if (g_bus.readPosition(tilt::SERVO_ID[request.knee_joint],
+                                       raw) == ESP_OK) {
+                    const float actual_height = tilt_orbit::heightFromKnee(
+                        tickToRad(request.knee_joint, raw));
+                    result.actual_lift_mm =
+                        tilt_orbit::kNominalHeightMm - actual_height;
+                    result.success = std::isfinite(result.actual_lift_mm);
+                }
+            }
+        }
+        xQueueOverwrite(g_measure_result_queue, &result);
+    }
 }
 
 void printGaitEvent(const tilt_orbit::GaitEvent& event) {
@@ -761,6 +922,8 @@ void printGaitEvent(const tilt_orbit::GaitEvent& event) {
     const float a = std::acos((tilt_orbit::kNominalHeightMm -
         tilt_orbit::calfVerticalMm()) / tilt::THIGH_LENGTH_MM);
     const float x_drift = event.delta_mm * std::cos(a) / std::sin(a);
+    g_stats.max_abs_x_drift_mm = std::max(
+        g_stats.max_abs_x_drift_mm, std::fabs(x_drift));
     const char stance = event.stance == tilt_orbit::GaitState::SSP_LEFT
         ? 'L' : 'R';
     if (g_csv) {
@@ -814,7 +977,7 @@ void serviceGait(std::uint32_t now) {
     if (out.measure_swing && out.swing_leg >= 0) {
         const float swing_height = out.swing_leg == kLeft
             ? out.left_mm : out.right_mm;
-        measureSwing(out.swing_leg, swing_height);
+        requestSwingMeasurement(out.swing_leg, swing_height);
     }
     printGaitEvent(out.event);
     if (g_csv) {
@@ -836,7 +999,7 @@ void printHelp() {
                 "  stand [height_mm] [lean_deg]   gait\n"
                 "Gait keys, no Enter: 1 ROCK / 2 OPEN / 3 ORBIT (stopped),\n"
                 "  space run/stop, [/] T, +/- lift, ,/. push, e energy,\n"
-                "  s/S startup shift, r zero roll (stopped), c CSV,\n"
+                "  s/S startup shift, r zero roll (stopped), c CSV, k lift measure,\n"
                 "  m model, v view, q exit, ! E-STOP.\n"
                 "Do not start on the floor before suspended check.\n\n");
 }
@@ -957,6 +1120,7 @@ void handleCommand(const Command& cmd) {
             std::printf("CSV %s.\n", g_csv ? "ON" : "OFF");
             if (g_csv) std::printf("t_ms,mode,state,roll_deg,rate_deg_s,h_L,h_R,delta\n");
             return;
+        case Cmd::LIFT_MEASURE: toggleLiftMeasurement(); return;
         case Cmd::VIEW: printView(); return;
         case Cmd::QUIT:
             g_gait.stop();
@@ -1022,6 +1186,7 @@ void enqueueGaitKey(std::uint8_t key) {
         case 'S': enqueue({Cmd::SHIFT_UP}); break;
         case 'r': case 'R': enqueue({Cmd::ZERO_ROLL}); break;
         case 'c': case 'C': enqueue({Cmd::CSV}); break;
+        case 'k': case 'K': enqueue({Cmd::LIFT_MEASURE}); break;
         case 'm': case 'M': enqueue({Cmd::MODEL}); break;
         case 'v': case 'V': enqueue({Cmd::VIEW}); break;
         case 'q': case 'Q': enqueue({Cmd::QUIT}); break;
@@ -1093,14 +1258,31 @@ extern "C" void app_main() {
     torqueOffBestEffort();
     std::printf("\nBoot: DISARMED, torque OFF, no automatic motion. "
                 "Keep physical servo-power cutoff nearby.\n");
+    if (tilt_orbit::kMappingConfigured) {
+        std::printf("Leg mapping from config: ID 11-13 = robot %s leg. "
+                    "roll sign = %+d. Run `check` to re-verify.\n",
+                    tilt_orbit::kSwapLegSides ? "RIGHT" : "LEFT",
+                    static_cast<int>(tilt_orbit::kRollSign));
+    } else {
+        std::printf("WARNING: physical left/right mapping is unverified. "
+                    "Run `check` before ORBIT.\n");
+    }
     g_queue = xQueueCreate(kQueueDepth, sizeof(Command));
-    if (g_queue == nullptr) {
+    g_measure_request_queue = xQueueCreate(1, sizeof(MeasureRequest));
+    g_measure_result_queue = xQueueCreate(1, sizeof(MeasureResult));
+    if (g_queue == nullptr || g_measure_request_queue == nullptr ||
+        g_measure_result_queue == nullptr) {
         ESP_LOGE(kTag, "queue allocation failed"); return;
     }
     xTaskCreate(consoleTask, "orbit_console", 4096, nullptr, 5, nullptr);
+    if (xTaskCreate(measurementTask, "orbit_measure", 3072, nullptr, 1,
+                    nullptr) != pdPASS) {
+        ESP_LOGE(kTag, "measurement task creation failed"); return;
+    }
     TickType_t wake = xTaskGetTickCount();
     while (true) {
         const std::uint32_t now = nowMs();
+        monitorLoopDelay(now);
         g_estimator.sample(now);
         Command command{};
         for (int i = 0; i < 8 &&
@@ -1109,6 +1291,7 @@ extern "C" void app_main() {
         }
         serviceRamp(now);
         serviceCheck(now);
+        serviceMeasurementResult();
         serviceGait(now);
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(tilt_orbit::kLoopPeriodMs));
     }

@@ -9,6 +9,10 @@ namespace tilt_orbit {
 
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
+
+float median3(float a, float b, float c) {
+    return std::max(std::min(a, b), std::min(std::max(a, b), c));
+}
 }
 
 const char* modeName(GaitMode mode) {
@@ -60,8 +64,12 @@ bool GaitController::start(std::uint32_t now_ms) {
     startup_halves_ = switches_ = watchdogs_ = 0;
     startup_good_halves_ = 0;
     startup_warned_ = previous_roll_valid_ = false;
+    roll_history_count_ = roll_history_next_ = 0;
     period_min_roll_deg_ = period_max_roll_deg_ = 0.0f;
     active_push_mm_ = push_mm_;
+    last_left_mm_ = last_right_mm_ = kNominalHeightMm;
+    stance_start_mm_ = kNominalHeightMm;
+    swing_carry_mm_ = 0.0f;
     peak_measured_ = false;
     return true;
 }
@@ -69,11 +77,19 @@ bool GaitController::start(std::uint32_t now_ms) {
 void GaitController::stop() {
     state_ = GaitState::IDLE;
     previous_roll_valid_ = false;
+    roll_history_count_ = roll_history_next_ = 0;
 }
 
 void GaitController::beginSsp(std::uint32_t now_ms, GaitState stance) {
     state_ = stance;
     state_started_ms_ = now_ms;
+    if (stance == GaitState::SSP_LEFT) {
+        stance_start_mm_ = last_left_mm_;
+        swing_carry_mm_ = kNominalHeightMm - last_right_mm_;
+    } else {
+        stance_start_mm_ = last_right_mm_;
+        swing_carry_mm_ = kNominalHeightMm - last_left_mm_;
+    }
     peak_toward_stance_deg_ = 0.0f;
     peak_measured_ = false;
     period_min_roll_deg_ = period_max_roll_deg_ = 0.0f;
@@ -86,6 +102,10 @@ GaitOutput GaitController::update(std::uint32_t now_ms,
     const std::uint32_t period_ms = static_cast<std::uint32_t>(
         std::lround(period_s_ * 1000.0f));
     if (roll.valid) {
+        roll_history_[roll_history_next_] = roll.roll_deg;
+        roll_history_next_ = static_cast<std::uint8_t>(
+            (roll_history_next_ + 1) % 3);
+        if (roll_history_count_ < 3) ++roll_history_count_;
         period_min_roll_deg_ = std::min(period_min_roll_deg_, roll.roll_deg);
         period_max_roll_deg_ = std::max(period_max_roll_deg_, roll.roll_deg);
     }
@@ -133,6 +153,8 @@ GaitOutput GaitController::update(std::uint32_t now_ms,
                                 std::sin(kPi * phase);
             output.left_mm = kNominalHeightMm - shift / 2.0f;
             output.right_mm = kNominalHeightMm + shift / 2.0f;
+            last_left_mm_ = output.left_mm;
+            last_right_mm_ = output.right_mm;
             return output;
         }
     }
@@ -150,12 +172,16 @@ GaitOutput GaitController::update(std::uint32_t now_ms,
     if (mode_ == GaitMode::OPEN) {
         switch_stance = elapsed >= period_ms;
     } else if (mode_ == GaitMode::ORBIT) {
-        const bool crossed = roll.valid && previous_roll_valid_ &&
-            ((previous_roll_deg_ < 0.0f && roll.roll_deg >= 0.0f) ||
-             (previous_roll_deg_ > 0.0f && roll.roll_deg <= 0.0f));
+        const bool median_valid = roll.valid && roll_history_count_ == 3;
+        const float crossing_roll = median_valid
+            ? median3(roll_history_[0], roll_history_[1], roll_history_[2])
+            : 0.0f;
+        const bool crossed = median_valid && previous_roll_valid_ &&
+            ((previous_roll_deg_ < 0.0f && crossing_roll >= 0.0f) ||
+             (previous_roll_deg_ > 0.0f && crossing_roll <= 0.0f));
         switch_stance = crossed &&
             std::fabs(roll.rate_deg_s) >= kCrossMinRateDegS &&
-            elapsed >= period_ms / 2;
+            elapsed >= period_ms / 4;
         if (!switch_stance && elapsed >= period_ms * 3 / 2) {
             switch_stance = watchdog = true;
         }
@@ -186,8 +212,13 @@ GaitOutput GaitController::update(std::uint32_t now_ms,
         beginSsp(now_ms, next);
         active_push_mm_ = push_mm_;
     }
-    previous_roll_valid_ = roll.valid;
-    if (roll.valid) previous_roll_deg_ = roll.roll_deg;
+    if (roll_history_count_ == 3) {
+        previous_roll_valid_ = roll.valid;
+        if (roll.valid) {
+            previous_roll_deg_ = median3(
+                roll_history_[0], roll_history_[1], roll_history_[2]);
+        }
+    }
 
     const float phase = std::clamp(
         static_cast<float>(now_ms - state_started_ms_) / period_ms,
@@ -195,21 +226,48 @@ GaitOutput GaitController::update(std::uint32_t now_ms,
     const float lift = swingBezier(phase, lift_mm_, kLiftZnegMm);
     const float push = phase < 1.0f - kPushWindow ? 0.0f :
         active_push_mm_ * (phase - (1.0f - kPushWindow)) / kPushWindow;
+    float swing_height = kNominalHeightMm - lift;
+    if (phase < kSwingBlendFraction) {
+        const float blend_remaining = std::max(
+            0.0f, 1.0f - phase / kSwingBlendFraction);
+        if (swing_carry_mm_ >= 0.0f) {
+            const float carried_lift = swing_carry_mm_ * blend_remaining;
+            swing_height = kNominalHeightMm - std::max(lift, carried_lift);
+        } else {
+            // The outgoing stance may be longer than nominal because of push.
+            // A straight bridge to the Bézier join point minimizes peak
+            // velocity while preserving both endpoint heights exactly.
+            const float blend_phase = phase / kSwingBlendFraction;
+            const float start_height = kNominalHeightMm - swing_carry_mm_;
+            const float join_height = kNominalHeightMm - swingBezier(
+                kSwingBlendFraction, lift_mm_, kLiftZnegMm);
+            swing_height = start_height +
+                (join_height - start_height) * blend_phase;
+        }
+    }
+    const float stance_blend = std::min(
+        1.0f, static_cast<float>(now_ms - state_started_ms_) /
+                  static_cast<float>(kStanceBlendMs));
+    const float stance_target = kNominalHeightMm + push;
+    const float stance_height = stance_start_mm_ +
+        (stance_target - stance_start_mm_) * stance_blend;
     output.phase = phase;
     output.delta_mm = push;
     if (state_ == GaitState::SSP_LEFT) {
-        output.left_mm = kNominalHeightMm + push;
-        output.right_mm = kNominalHeightMm - lift;
+        output.left_mm = stance_height;
+        output.right_mm = swing_height;
         output.swing_leg = 1;
     } else {
-        output.left_mm = kNominalHeightMm - lift;
-        output.right_mm = kNominalHeightMm + push;
+        output.left_mm = swing_height;
+        output.right_mm = stance_height;
         output.swing_leg = 0;
     }
     if (phase >= 0.5f && !peak_measured_) {
         peak_measured_ = true;
         output.measure_swing = true;
     }
+    last_left_mm_ = output.left_mm;
+    last_right_mm_ = output.right_mm;
     return output;
 }
 

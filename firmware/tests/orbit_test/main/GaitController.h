@@ -69,11 +69,18 @@ private:
     float push_mm_ = kPushDefaultMm;
     float active_push_mm_ = kPushDefaultMm;
     float startup_shift_mm_ = kStartupShiftMm;
+    float last_left_mm_ = kNominalHeightMm;
+    float last_right_mm_ = kNominalHeightMm;
+    float stance_start_mm_ = kNominalHeightMm;
+    float swing_carry_mm_ = 0.0f;
     bool energy_enabled_ = false;
     bool peak_measured_ = false;
     bool startup_warned_ = false;
     bool previous_roll_valid_ = false;
     float previous_roll_deg_ = 0.0f;
+    float roll_history_[3]{};
+    std::uint8_t roll_history_count_ = 0;
+    std::uint8_t roll_history_next_ = 0;
     float peak_toward_stance_deg_ = 0.0f;
     float period_min_roll_deg_ = 0.0f;
     float period_max_roll_deg_ = 0.0f;
