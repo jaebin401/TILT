@@ -67,6 +67,9 @@ bool GaitController::start(std::uint32_t now_ms) {
     roll_history_count_ = roll_history_next_ = 0;
     period_min_roll_deg_ = period_max_roll_deg_ = 0.0f;
     active_push_mm_ = push_mm_;
+    last_left_mm_ = last_right_mm_ = kNominalHeightMm;
+    stance_start_mm_ = kNominalHeightMm;
+    swing_carry_mm_ = 0.0f;
     peak_measured_ = false;
     return true;
 }
@@ -80,6 +83,13 @@ void GaitController::stop() {
 void GaitController::beginSsp(std::uint32_t now_ms, GaitState stance) {
     state_ = stance;
     state_started_ms_ = now_ms;
+    if (stance == GaitState::SSP_LEFT) {
+        stance_start_mm_ = last_left_mm_;
+        swing_carry_mm_ = kNominalHeightMm - last_right_mm_;
+    } else {
+        stance_start_mm_ = last_right_mm_;
+        swing_carry_mm_ = kNominalHeightMm - last_left_mm_;
+    }
     peak_toward_stance_deg_ = 0.0f;
     peak_measured_ = false;
     period_min_roll_deg_ = period_max_roll_deg_ = 0.0f;
@@ -143,6 +153,8 @@ GaitOutput GaitController::update(std::uint32_t now_ms,
                                 std::sin(kPi * phase);
             output.left_mm = kNominalHeightMm - shift / 2.0f;
             output.right_mm = kNominalHeightMm + shift / 2.0f;
+            last_left_mm_ = output.left_mm;
+            last_right_mm_ = output.right_mm;
             return output;
         }
     }
@@ -169,7 +181,7 @@ GaitOutput GaitController::update(std::uint32_t now_ms,
              (previous_roll_deg_ > 0.0f && crossing_roll <= 0.0f));
         switch_stance = crossed &&
             std::fabs(roll.rate_deg_s) >= kCrossMinRateDegS &&
-            elapsed >= period_ms / 2;
+            elapsed >= period_ms / 4;
         if (!switch_stance && elapsed >= period_ms * 3 / 2) {
             switch_stance = watchdog = true;
         }
@@ -214,21 +226,48 @@ GaitOutput GaitController::update(std::uint32_t now_ms,
     const float lift = swingBezier(phase, lift_mm_, kLiftZnegMm);
     const float push = phase < 1.0f - kPushWindow ? 0.0f :
         active_push_mm_ * (phase - (1.0f - kPushWindow)) / kPushWindow;
+    float swing_height = kNominalHeightMm - lift;
+    if (phase < kSwingBlendFraction) {
+        const float blend_remaining = std::max(
+            0.0f, 1.0f - phase / kSwingBlendFraction);
+        if (swing_carry_mm_ >= 0.0f) {
+            const float carried_lift = swing_carry_mm_ * blend_remaining;
+            swing_height = kNominalHeightMm - std::max(lift, carried_lift);
+        } else {
+            // The outgoing stance may be longer than nominal because of push.
+            // A straight bridge to the Bézier join point minimizes peak
+            // velocity while preserving both endpoint heights exactly.
+            const float blend_phase = phase / kSwingBlendFraction;
+            const float start_height = kNominalHeightMm - swing_carry_mm_;
+            const float join_height = kNominalHeightMm - swingBezier(
+                kSwingBlendFraction, lift_mm_, kLiftZnegMm);
+            swing_height = start_height +
+                (join_height - start_height) * blend_phase;
+        }
+    }
+    const float stance_blend = std::min(
+        1.0f, static_cast<float>(now_ms - state_started_ms_) /
+                  static_cast<float>(kStanceBlendMs));
+    const float stance_target = kNominalHeightMm + push;
+    const float stance_height = stance_start_mm_ +
+        (stance_target - stance_start_mm_) * stance_blend;
     output.phase = phase;
     output.delta_mm = push;
     if (state_ == GaitState::SSP_LEFT) {
-        output.left_mm = kNominalHeightMm + push;
-        output.right_mm = kNominalHeightMm - lift;
+        output.left_mm = stance_height;
+        output.right_mm = swing_height;
         output.swing_leg = 1;
     } else {
-        output.left_mm = kNominalHeightMm - lift;
-        output.right_mm = kNominalHeightMm + push;
+        output.left_mm = swing_height;
+        output.right_mm = stance_height;
         output.swing_leg = 0;
     }
     if (phase >= 0.5f && !peak_measured_) {
         peak_measured_ = true;
         output.measure_swing = true;
     }
+    last_left_mm_ = output.left_mm;
+    last_right_mm_ = output.right_mm;
     return output;
 }
 

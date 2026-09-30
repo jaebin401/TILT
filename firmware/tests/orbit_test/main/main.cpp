@@ -76,6 +76,7 @@ struct RunningStats {
     float clearance_sum = 0.0f;
     float clearance_min = 0.0f;
     std::uint32_t clearance_count = 0;
+    float max_abs_x_drift_mm = 0.0f;
     std::uint32_t rejected_targets = 0;
     std::uint32_t speed_guards = 0;
     std::uint32_t loop_delays = 0;
@@ -583,6 +584,8 @@ void printSummary() {
                     g_stats.clearance_sum / g_stats.clearance_count,
                     g_stats.clearance_min);
     else std::printf("  estimated foot clearance --\n");
+    std::printf("  max x drift %.1fmm (support-foot fore-aft motion from push)\n",
+                g_stats.max_abs_x_drift_mm);
     std::printf("  final push delta %.1fmm, rejected targets %lu, "
                 "speed guard %lu\n", g_gait.pushMm(),
                 static_cast<unsigned long>(g_stats.rejected_targets),
@@ -919,6 +922,8 @@ void printGaitEvent(const tilt_orbit::GaitEvent& event) {
     const float a = std::acos((tilt_orbit::kNominalHeightMm -
         tilt_orbit::calfVerticalMm()) / tilt::THIGH_LENGTH_MM);
     const float x_drift = event.delta_mm * std::cos(a) / std::sin(a);
+    g_stats.max_abs_x_drift_mm = std::max(
+        g_stats.max_abs_x_drift_mm, std::fabs(x_drift));
     const char stance = event.stance == tilt_orbit::GaitState::SSP_LEFT
         ? 'L' : 'R';
     if (g_csv) {
